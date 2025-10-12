@@ -1,0 +1,7 @@
+<library path="lib/libvoxel_slam">
+  <class name="voxel_slam/VoxelSlamNodelet" type="voxel_slam::VoxelSlamNodelet" base_class_type="nodelet::Nodelet">
+    <description>
+    Voxel SLAM nodelet with accumulation and frame configuration
+    </description>
+  </class>
+</library>
