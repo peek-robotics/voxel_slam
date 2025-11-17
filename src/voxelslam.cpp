@@ -1645,7 +1645,40 @@ public:
         surf_map_slide.clear();
 
         x_curr.setZero();
-        x_curr.p = Eigen::Vector3d(0, 0, 30);
+        
+        // Initialize from TF if enabled
+        bool initialized_from_tf = false;
+        if (use_odom_init_tf)
+        {
+            try
+            {
+                tf::TransformListener tf_listener;
+                tf::StampedTransform tf_st;
+                tf_listener.waitForTransform(odom_link, base_link, ros::Time(0), ros::Duration(0.5));
+                tf_listener.lookupTransform(odom_link, base_link, ros::Time(0), tf_st);
+
+                tf::Vector3 t = tf_st.getOrigin();
+                tf::Quaternion q = tf_st.getRotation();
+
+                Eigen::Quaterniond qe(q.w(), q.x(), q.y(), q.z());
+                x_curr.R = qe.toRotationMatrix();
+                x_curr.p = Eigen::Vector3d(t.x(), t.y(), t.z());
+                initialized_from_tf = true;
+                ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
+                                << ": p=[" << x_curr.p.transpose() << "]");
+            }
+            catch (const tf::TransformException& ex)
+            {
+                ROS_WARN_STREAM("Failed to get TF for reset, using default: " << ex.what());
+            }
+        }
+        
+        // Fall back to default position if TF not available
+        if (!initialized_from_tf)
+        {
+            x_curr.p = Eigen::Vector3d(0, 0, 30);
+        }
+        
         odom_ekf.mean_acc.setZero();
         odom_ekf.init_num = 0;
         odom_ekf.IMU_init(imus);
