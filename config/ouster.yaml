@@ -20,13 +20,6 @@ General:
                    0, 0,-1]
   is_save_map: 0
 
-GNSS:
-  enable: false
-  topic: "/odometry/gps"
-  max_delay: 0.2
-  buffer_window: 5.0
-  noise_variances: [0.25, 0.25, 0.25, 0.01, 0.01, 0.01]
-
 EKF:
   cov_gyr: 0.01 # 0.01
   cov_acc: 1

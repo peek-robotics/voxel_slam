@@ -963,18 +963,17 @@ public:
         n.param<bool>("General/imu_flip_z", flip_imu_z, false);
         n.param<bool>("General/send_tf", send_tf, true);
         n.param<bool>("General/use_odom_init_tf", use_odom_init_tf, false);
-        n.param<bool>("General/pub_local_accumulated", pub_local_accumulated, false);
         n.param<bool>("General/enable_local_mapping", enable_local_mapping, true);
         n.param<bool>("General/enable_loop_closure", enable_loop_closure, true);
         n.param<bool>("General/use_external_odom_tf", use_external_odom_tf, false);
-        n.param<bool>("WheelOdom/wheel_odom_check", wheel_odom_check_enabled_, false);
-        n.param<string>("WheelOdom/wheel_odom_topic", wheel_odom_topic_, string("/odometry/grover"));
-        n.param<double>("WheelOdom/wheel_odom_tolerance_ratio", wheel_odom_ratio_tolerance_, 0.5);
-        n.param<double>("WheelOdom/wheel_odom_factor", wheel_odom_ratio_tolerance_, wheel_odom_ratio_tolerance_);
-        n.param<double>("WheelOdom/wheel_odom_min_tolerance", wheel_odom_min_abs_tolerance_, 0.05);
-        n.param<int>("WheelOdom/wheel_odom_violation_frames", wheel_odom_violation_limit_, 10);
-        n.param<double>("WheelOdom/wheel_odom_timeout", wheel_odom_timeout_sec_, 0.5);
+        n.param<bool>("WheelOdom/enable", wheel_odom_check_enabled_, false);
+        n.param<string>("WheelOdom/topic", wheel_odom_topic_, string("/odometry/grover"));
+        n.param<double>("WheelOdom/tolerance_ratio", wheel_odom_ratio_tolerance_, 0.5);
+        n.param<double>("WheelOdom/min_tolerance", wheel_odom_min_abs_tolerance_, 0.05);
+        n.param<int>("WheelOdom/violation_frames", wheel_odom_violation_limit_, 10);
+        n.param<double>("WheelOdom/timeout", wheel_odom_timeout_sec_, 0.5);
         // Local accumulated parameters
+        n.param<bool>("LocalAccumulated/pub_local_accumulated", pub_local_accumulated, false);
         n.param<int>("LocalAccumulated/rolling_buffer_size", rolling_buffer_size_, 20);
         n.param<double>("LocalAccumulated/cropbox_min_x", cropbox_min_x_, -50.0);
         n.param<double>("LocalAccumulated/cropbox_max_x", cropbox_max_x_, 50.0);
@@ -1064,7 +1063,9 @@ public:
         n.param<int>("LocalBA/thread_num", thread_num, 5);
 
         for (double& iter : plane_eigen_value_thre)
+        {
             iter = 1.0 / iter;
+        }
         // for(double &iter: plane_eigen_value_thre) iter = 1.0 / iter;
 
         noiseMeas.setZero();

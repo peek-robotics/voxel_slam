@@ -1,15 +1,17 @@
 # Voxel-SLAM: A Complete, Accurate, and Versatile LiDAR-Inertial SLAM System
 
-# Peek Robotics Modifications
-
-### This has been messed with heavy in certain key ways:
-- Nodeletized structure
+## Peek Robotics modifications
+- Nodeletized wrapper added
 - Configurable frames / topics
 - Disable-able global mapping
 - Local accumulated frames with crop box
 - Added livox pcl2 support
 - Disableable tf pub
 - Ability to start and recover from current odom
+- Added alternate odom source input as a sanity check reset (avoid runaways in corridors)
+- Merged [LTU-RAI's mods](https://github.com/LTU-RAI/Voxel-SLAM).
+
+### Added features are purely for our use cases and are not guaranteed to work with all existing features
 
 ## 1. Introduction
 
