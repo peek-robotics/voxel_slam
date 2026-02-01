@@ -48,6 +48,88 @@ namespace std
   };
 }
 
+// Degradation state tracking for SLAM
+static constexpr int kDegradeResetThreshold = 50;
+static constexpr int kDegradeDropHysteresisFrames = 10;
+
+enum class DegradeState : uint8_t
+{
+    Ok = 1,
+    Low = 2,
+    Medium = 4,
+    High = 8,
+    Reset = 16,
+};
+
+struct DegradeStateTracker
+{
+    DegradeState state = DegradeState::Ok;
+    DegradeState pending_drop = DegradeState::Ok;
+    int pending_drop_frames = 0;
+    bool initialized = false;
+
+    void reset(DegradeState s = DegradeState::Ok)
+    {
+        state = s;
+        pending_drop = s;
+        pending_drop_frames = 0;
+        initialized = true;
+    }
+
+    DegradeState current() const { return state; }
+
+    DegradeState update(DegradeState candidate)
+    {
+        if (!initialized)
+        {
+            reset(candidate);
+            return state;
+        }
+
+        const uint8_t cand = static_cast<uint8_t>(candidate);
+        const uint8_t cur = static_cast<uint8_t>(state);
+
+        // Worsening is immediate.
+        if (cand > cur)
+        {
+            state = candidate;
+            pending_drop = candidate;
+            pending_drop_frames = 0;
+            return state;
+        }
+
+        // Improvement requires N consecutive frames.
+        if (cand < cur)
+        {
+            if (pending_drop != candidate)
+            {
+                pending_drop = candidate;
+                pending_drop_frames = 1;
+            }
+            else
+            {
+                pending_drop_frames++;
+            }
+
+            if (pending_drop_frames >= kDegradeDropHysteresisFrames)
+            {
+                state = candidate;
+                pending_drop = candidate;
+                pending_drop_frames = 0;
+            }
+            return state;
+        }
+
+        // Stable -> clear any pending drop.
+        pending_drop = candidate;
+        pending_drop_frames = 0;
+        return state;
+    }
+};
+
+// Global degrade state tracker pointer (will be set by VOXEL_SLAM)
+extern DegradeStateTracker* g_degrade_state_tracker;
+
 Eigen::Matrix3d Exp(const Eigen::Vector3d &ang)
 {
   double ang_norm = ang.norm();
