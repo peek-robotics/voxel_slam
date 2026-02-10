@@ -34,31 +34,25 @@ public:
     {
         Eigen::Quaterniond q_this(xc.R);
         Eigen::Vector3d t_this = xc.p;
-        Eigen::Vector3d v_this_imu = xc.v;
 
         // Stamp odometry with the state time (LiDAR scan end time) when available.
         // `IMUEKF::motion_blur()` sets `xc.t = pcl_end_time`.
         ros::Time ct;
-        if (xc.t > 0.0)
-            ct.fromSec(xc.t);
-        else
-            ct = ros::Time::now();
+        ct.fromSec(xc.t);
+        // if (xc.t > 0.0)
+        //     ct.fromSec(xc.t);
+        // else
+        //     ct = ros::Time::now();
 
-        if (send_tf)
+        // Grab latest IMU (used for angular velocity + covariance)
+        sensor_msgs::Imu::Ptr latest_imu;
         {
-            static tf::TransformBroadcaster br;
-            tf::Transform transform;
-            tf::Quaternion q;
-            transform.setOrigin(tf::Vector3(t_this.x(), -t_this.y(), -t_this.z()));
-            q.setW(q_this.w());
-            q.setX(q_this.x());
-            q.setY(q_this.y());
-            q.setZ(-q_this.z());
-            transform.setRotation(q);
-            br.sendTransform(
-                    tf::StampedTransform(transform, ct, odom_link, base_link));
+            lock_guard<mutex> lock(mBuf);
+            if (!imu_buf.empty())
+                latest_imu = imu_buf.back();
         }
 
+        // Prepare odometry message
         nav_msgs::Odometry odom_msg;
         odom_msg.header.frame_id = odom_link;
         odom_msg.header.stamp = ct;
@@ -71,34 +65,29 @@ public:
         odom_msg.pose.pose.orientation.y = q_this.y();
         odom_msg.pose.pose.orientation.z = -q_this.z();
 
-        // --- Pose Covariance (rotation + position: 6x6) ---
-        // Assuming xc.cov is at least 6x6, with layout: [rotation(0:3), position(3:6), ...]
+        // --- Pose Covariance (position + rotation: 6x6) ---
+        // IMUST state layout: [rot(0:3), pos(3:6), ...]
+        // ROS pose covariance layout: [x y z rotX rotY rotZ].
         if (xc.cov.rows() >= 6 && xc.cov.cols() >= 6)
         {
+            const int idx[6] = {3, 4, 5, 0, 1, 2}; // ROS->IMUST index mapping
             for (int i = 0; i < 6; i++)
             {
                 for (int j = 0; j < 6; j++)
                 {
-                    odom_msg.pose.covariance[i * 6 + j] = xc.cov(i, j);
+                    odom_msg.pose.covariance[i * 6 + j] = xc.cov(idx[i], idx[j]);
                 }
             }
         }
 
         // --- Linear velocity (world → body) ---
-        Eigen::Vector3d vel_body = xc.R.transpose() * xc.v;
+        const Eigen::Vector3d vel_body = xc.R.transpose() * xc.v;
         odom_msg.twist.twist.linear.x = vel_body.x();
         odom_msg.twist.twist.linear.y = vel_body.y();
         odom_msg.twist.twist.linear.z = vel_body.z();
 
         // --- Angular velocity (body frame) ---
         // Use latest IMU measurement (body frame) minus estimated gyro bias.
-        sensor_msgs::Imu::Ptr latest_imu;
-        {
-            lock_guard<mutex> lock(mBuf);
-            if (!imu_buf.empty())
-                latest_imu = imu_buf.back();
-        }
-
         if (latest_imu)
         {
             Eigen::Vector3d angvel_raw(latest_imu->angular_velocity.x,
@@ -118,9 +107,10 @@ public:
 
         // --- Twist Covariance (linear vel + angular vel: 6x6) ---
         // IMUST state ordering (DIM=15): [rot(0:3), pos(3:6), vel(6:9), bg(9:12), ba(12:15)].
+        // ROS twist covariance layout: [vx vy vz wx wy wz].
         // We publish linear velocity in body frame: v_body = R^T v_world.
-        // Approximate covariance: Cov(v_body) = R^T Cov(v_world) R.
-        // Angular velocity is from IMU gyro minus bias; approximate covariance as
+        // Cov(v_body) = R^T Cov(v_world) R, and Cov(v_body, bg) = R^T Cov(v_world, bg).
+        // Angular velocity is gyro minus bias; approximate covariance as
         // Cov(gyro_meas) + Cov(bg) when gyro covariance is provided.
         for (int k = 0; k < 36; ++k)
             odom_msg.twist.covariance[k] = 0.0;
@@ -129,6 +119,8 @@ public:
         {
             const Eigen::Matrix3d cov_v_world = xc.cov.block<3, 3>(6, 6);
             const Eigen::Matrix3d cov_v_body = xc.R.transpose() * cov_v_world * xc.R;
+            const Eigen::Matrix3d cov_v_bg_world = xc.cov.block<3, 3>(6, 9);
+            const Eigen::Matrix3d cov_v_bg_body = xc.R.transpose() * cov_v_bg_world;
 
             for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j)
@@ -152,6 +144,14 @@ public:
             for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j)
                     odom_msg.twist.covariance[(i + 3) * 6 + (j + 3)] = cov_w(i, j);
+
+            // Cross-covariance between linear and angular components (vx,vy,vz) x (wx,wy,wz).
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                {
+                    odom_msg.twist.covariance[i * 6 + (j + 3)] = cov_v_bg_body(i, j);
+                    odom_msg.twist.covariance[(j + 3) * 6 + i] = cov_v_bg_body(i, j);
+                }
         }
 
         // Set high covariance during initialization or high degradation
@@ -166,9 +166,12 @@ public:
         if (high_uncertainty)
         {
             for (auto& v : odom_msg.pose.covariance)
-                v = 1.0;
+                if (v != 0.0)
+                    v = 1e3;
             for (auto& v : odom_msg.twist.covariance)
-                v = 1.0;
+                if (v != 0.0)
+                    v = 1e3;
+            return;
         }
         else if (g_degrade_state_tracker)
         {
@@ -179,6 +182,21 @@ public:
                 for (auto& v : odom_msg.pose.covariance)
                     v *= mult;
             }
+        }
+
+        if (send_tf)
+        {
+            static tf::TransformBroadcaster br;
+            tf::Transform transform;
+            tf::Quaternion q;
+            transform.setOrigin(tf::Vector3(t_this.x(), t_this.y(), t_this.z()));
+            q.setW(q_this.w());
+            q.setX(q_this.x());
+            q.setY(q_this.y());
+            q.setZ(-q_this.z());
+            transform.setRotation(q);
+            br.sendTransform(
+                    tf::StampedTransform(transform, ct, odom_link, base_link));
         }
 
         pub_odom.publish(odom_msg);
@@ -195,8 +213,8 @@ public:
             Eigen::Vector3d pvec = pw;
             PointType ap;
             ap.x = pvec.x();
-            ap.y = -pvec.y();
-            ap.z = -pvec.z();
+            ap.y = pvec.y();
+            ap.z = pvec.z();
             pcl_send.push_back(ap);
         }
         pub_pl_func(pcl_send, pub_scan);
@@ -226,8 +244,8 @@ public:
                 Eigen::Vector3d pvec = x_buf[i].R * pv.pnt + x_buf[i].p;
                 PointType ap;
                 ap.x = pvec[0];
-                ap.y = -pvec[1];
-                ap.z = -pvec[2];
+                ap.y = pvec[1];
+                ap.z = pvec[2];
                 ap.intensity = cur_session;
                 pcl_send.push_back(ap);
             }
@@ -237,8 +255,8 @@ public:
         {
             Eigen::Vector3d pcurr = x_buf[i].p;
             pcl_path[i + win_base].x = pcurr[0];
-            pcl_path[i + win_base].y = -pcurr[1];
-            pcl_path[i + win_base].z = -pcurr[2];
+            pcl_path[i + win_base].y = pcurr[1];
+            pcl_path[i + win_base].z = pcurr[2];
         }
 
         pub_pl_func(pcl_path, pub_curr_path);
@@ -258,8 +276,8 @@ public:
             for (ScanPose* bl : *(relc_bl_buf[ids[i]]))
             {
                 pp.x = bl->x.p[0];
-                pp.y = -bl->x.p[1];
-                pp.z = -bl->x.p[2];
+                pp.y = bl->x.p[1];
+                pp.z = bl->x.p[2];
                 pl.push_back(pp);
             }
         }
@@ -297,8 +315,8 @@ public:
                     Eigen::Vector3d vv(ap.x, ap.y, ap.z);
                     vv = xx.R * vv + xx.p;
                     pp.x = vv[0];
-                    pp.y = -vv[1];
-                    pp.z = -vv[2];
+                    pp.y = vv[1];
+                    pp.z = vv[2];
                     pl.push_back(pp);
                 }
 

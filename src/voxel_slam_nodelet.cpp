@@ -1,5 +1,5 @@
 // Minimal nodelet wrapper for Voxel-SLAM to avoid multiple definitions
-#include "voxel_slam_nodelet.h"
+#include "voxel_slam_nodelet.hpp"
 
 #include <pluginlib/class_list_macros.h>
 #include <thread>

@@ -1,5 +1,5 @@
 General:
-  lid_topic:  "/lidar_3d/livox/lidar_filtered"
+  lid_topic:  "/lidar_3d/livox/lidar"
   imu_topic:  "/lidar_3d/livox/imu"
   odom_link: "map"
   base_link: "livox_frame"

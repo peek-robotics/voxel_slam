@@ -1,4 +1,4 @@
-#include "BTC.h"
+#include "BTC.hpp"
 
 void read_parameters(ros::NodeHandle &nh, ConfigSetting &config_setting, int isHighFly)
 {
