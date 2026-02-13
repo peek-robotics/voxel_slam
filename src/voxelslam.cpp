@@ -19,6 +19,8 @@ double motion_init_eig_threshold_ = 15.0;
 DegradeStateTracker* g_degrade_state_tracker = nullptr;
 // Global flag indicating if system is in initialization phase
 bool g_is_initializing = true;
+// Global fixed covariance multiplier (applied before degrade-state scaling)
+double g_cov_mult = 10.0;
 
 class ResultOutput
 {
@@ -152,6 +154,15 @@ public:
                     odom_msg.twist.covariance[i * 6 + (j + 3)] = cov_v_bg_body(i, j);
                     odom_msg.twist.covariance[(j + 3) * 6 + i] = cov_v_bg_body(i, j);
                 }
+        }
+
+        // Apply fixed covariance multiplier before dynamic degradation scaling.
+        if (g_cov_mult != 1.0)
+        {
+            for (auto& v : odom_msg.pose.covariance)
+                v *= g_cov_mult;
+            for (auto& v : odom_msg.twist.covariance)
+                v *= g_cov_mult;
         }
 
         // Set high covariance during initialization or high degradation
@@ -1128,6 +1139,7 @@ public:
         n.param<double>("Odometry/dept_err", dept_err, 0.02);
         n.param<double>("Odometry/beam_err", beam_err, 0.05);
         n.param<double>("Odometry/voxel_size", voxel_size, 1);
+        n.param<double>("Odometry/cov_mult", g_cov_mult, 1.0);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
