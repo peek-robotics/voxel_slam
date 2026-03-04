@@ -28,10 +28,11 @@ using namespace std;
 ros::Publisher pub_scan, pub_cmap, pub_init, pub_pmap;
 ros::Publisher pub_test, pub_prev_path, pub_curr_path;
 ros::Publisher pub_odom;
+ros::Publisher pub_odom_global;
 ros::Publisher pub_local_accum_cloud; // publishes local accumulated cloud frames
 ros::Subscriber sub_imu, sub_pcl, sub_accumulated; // optional subscription to external accumulated cloud
 
-string base_link, odom_link;
+string base_link, odom_link, map_link;
 bool flip_imu_z = false;
 bool send_tf = true;
 

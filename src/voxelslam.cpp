@@ -60,12 +60,12 @@ public:
         odom_msg.header.stamp = ct;
         odom_msg.child_frame_id = base_link;
         odom_msg.pose.pose.position.x = t_this.x();
-        odom_msg.pose.pose.position.y = -t_this.y();
-        odom_msg.pose.pose.position.z = -t_this.z();
+        odom_msg.pose.pose.position.y = t_this.y();
+        odom_msg.pose.pose.position.z = t_this.z();
         odom_msg.pose.pose.orientation.w = q_this.w();
         odom_msg.pose.pose.orientation.x = q_this.x();
         odom_msg.pose.pose.orientation.y = q_this.y();
-        odom_msg.pose.pose.orientation.z = -q_this.z();
+        odom_msg.pose.pose.orientation.z = q_this.z();
 
         // --- Pose Covariance (position + rotation: 6x6) ---
         // IMUST state layout: [rot(0:3), pos(3:6), ...]
@@ -204,7 +204,7 @@ public:
             q.setW(q_this.w());
             q.setX(q_this.x());
             q.setY(q_this.y());
-            q.setZ(-q_this.z());
+            q.setZ(q_this.z());
             transform.setRotation(q);
             br.sendTransform(
                     tf::StampedTransform(transform, ct, odom_link, base_link));
@@ -234,8 +234,8 @@ public:
 
         PointType ap;
         ap.x = pcurr[0];
-        ap.y = -pcurr[1];
-        ap.z = -pcurr[2];
+        ap.y = pcurr[1];
+        ap.z = pcurr[2];
         ap.curvature = jour;
         ap.intensity = cur_session;
         pcl_path.push_back(ap);
@@ -988,6 +988,13 @@ public:
     float last_wheel_odom_tolerance_ = 0.0f;
     ros::Time last_wheel_odom_stamp_;
     nav_msgs::Odometry::ConstPtr last_wheel_odom_msg_;
+    string wheel_odom_velocity_frame_;
+    bool wheel_odom_frame_initialized_ = false;
+    bool wheel_odom_transform_required_ = false;
+    bool wheel_odom_transform_ready_ = false;
+    Eigen::Matrix3d wheel_odom_rot_from_base_ = Eigen::Matrix3d::Identity();
+    ros::Time wheel_odom_last_tf_lookup_attempt_;
+    std::unique_ptr<tf::TransformListener> wheel_odom_tf_listener_;
     mutex wheel_odom_mutex_;
 
     // Diagnostics
@@ -1115,6 +1122,7 @@ public:
 
         if (wheel_odom_check_enabled_)
         {
+            wheel_odom_tf_listener_.reset(new tf::TransformListener());
             sub_wheel_odom_ = n.subscribe<nav_msgs::Odometry>(wheel_odom_topic_, 50,
                                                               &VOXEL_SLAM::wheelOdomCallback, this);
             ROS_INFO_STREAM("Wheel odom sanity check enabled on " << wheel_odom_topic_
@@ -1252,22 +1260,98 @@ public:
 
     void wheelOdomCallback(const nav_msgs::Odometry::ConstPtr& msg)
     {
-        lock_guard<mutex> lock(wheel_odom_mutex_);
-        last_wheel_odom_msg_ = msg;
-        last_wheel_odom_stamp_ = msg->header.stamp;
+        bool should_lookup_tf = false;
+        string velocity_frame;
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            last_wheel_odom_msg_ = msg;
+            last_wheel_odom_stamp_ = msg->header.stamp;
+
+            if (!wheel_odom_frame_initialized_)
+            {
+                velocity_frame = msg->child_frame_id.empty() ? msg->header.frame_id : msg->child_frame_id;
+                if (velocity_frame.empty())
+                {
+                    velocity_frame = base_link;
+                    ROS_WARN("Wheel odom frame not provided (empty child_frame_id/header.frame_id); assuming base_link '%s'", base_link.c_str());
+                }
+
+                wheel_odom_velocity_frame_ = velocity_frame;
+                wheel_odom_frame_initialized_ = true;
+                wheel_odom_transform_required_ = (wheel_odom_velocity_frame_ != base_link);
+                wheel_odom_transform_ready_ = !wheel_odom_transform_required_;
+
+                if (wheel_odom_transform_required_)
+                {
+                    ROS_INFO_STREAM("Wheel odom velocity frame is '" << wheel_odom_velocity_frame_
+                                                                      << "' (odom child frame is '" << base_link
+                                                                      << "'), will transform SLAM velocity for sanity check");
+                }
+            }
+
+            should_lookup_tf = wheel_odom_transform_required_ && !wheel_odom_transform_ready_;
+            velocity_frame = wheel_odom_velocity_frame_;
+        }
+
+        if (should_lookup_tf && wheel_odom_tf_listener_)
+        {
+            const ros::Time now = ros::Time::now();
+            {
+                lock_guard<mutex> lock(wheel_odom_mutex_);
+                if ((now - wheel_odom_last_tf_lookup_attempt_).toSec() < 1.0)
+                    return;
+                wheel_odom_last_tf_lookup_attempt_ = now;
+            }
+
+            tf::StampedTransform tf_st;
+            try
+            {
+                wheel_odom_tf_listener_->waitForTransform(velocity_frame, base_link, ros::Time(0), ros::Duration(0.1));
+                wheel_odom_tf_listener_->lookupTransform(velocity_frame, base_link, ros::Time(0), tf_st);
+
+                const tf::Matrix3x3& basis = tf_st.getBasis();
+                Eigen::Matrix3d rot;
+                rot << basis[0][0], basis[0][1], basis[0][2],
+                        basis[1][0], basis[1][1], basis[1][2],
+                        basis[2][0], basis[2][1], basis[2][2];
+
+                lock_guard<mutex> lock(wheel_odom_mutex_);
+                wheel_odom_rot_from_base_ = rot;
+                wheel_odom_transform_ready_ = true;
+                ROS_INFO_STREAM("Wheel odom sanity check transform ready: " << base_link << " -> " << velocity_frame);
+            }
+            catch (const tf::TransformException& ex)
+            {
+                ROS_WARN_THROTTLE(2.0,
+                                  "Waiting for wheel odom sanity transform %s -> %s: %s",
+                                  base_link.c_str(), velocity_frame.c_str(), ex.what());
+            }
+        }
     }
 
-    bool evaluateWheelOdomSanity(double slam_vx_body, string& error_msg)
+    bool evaluateWheelOdomSanity(const Eigen::Vector3d& slam_vel_body,
+                                 const string& odom_child_frame,
+                                 string& error_msg)
     {
         if (!wheel_odom_check_enabled_)
             return true;
 
         nav_msgs::Odometry::ConstPtr wheel_msg;
         ros::Time wheel_stamp;
+        bool frame_initialized = false;
+        bool transform_required = false;
+        bool transform_ready = false;
+        string wheel_velocity_frame;
+        Eigen::Matrix3d rot_from_base = Eigen::Matrix3d::Identity();
         {
             lock_guard<mutex> lock(wheel_odom_mutex_);
             wheel_msg = last_wheel_odom_msg_;
             wheel_stamp = last_wheel_odom_stamp_;
+            frame_initialized = wheel_odom_frame_initialized_;
+            transform_required = wheel_odom_transform_required_;
+            transform_ready = wheel_odom_transform_ready_;
+            wheel_velocity_frame = wheel_odom_velocity_frame_;
+            rot_from_base = wheel_odom_rot_from_base_;
         }
 
         if (!wheel_msg)
@@ -1286,9 +1370,30 @@ public:
             return true; // stale data, skip check
         }
 
+        if (!frame_initialized)
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            last_wheel_odom_diff_ = 0.0f;
+            last_wheel_odom_tolerance_ = 0.0f;
+            return true;
+        }
+
+        if (transform_required && !transform_ready)
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            last_wheel_odom_diff_ = 0.0f;
+            last_wheel_odom_tolerance_ = 0.0f;
+            return true;
+        }
+
+        Eigen::Vector3d slam_vel_in_wheel = slam_vel_body;
+        if (transform_required)
+            slam_vel_in_wheel = rot_from_base * slam_vel_body;
+
+        const double slam_vx_for_check = slam_vel_in_wheel.x();
         const double wheel_vx = wheel_msg->twist.twist.linear.x;
         const double tolerance = max(fabs(wheel_vx) * wheel_odom_ratio_tolerance_, wheel_odom_min_abs_tolerance_);
-        const double diff = fabs(slam_vx_body - wheel_vx);
+        const double diff = fabs(slam_vx_for_check - wheel_vx);
 
         {
             lock_guard<mutex> lock(wheel_odom_mutex_);
@@ -1313,9 +1418,11 @@ public:
         if (diff > tolerance)
         {
             ostringstream oss;
-            oss << "Wheel odom mismatch: slam_vx=" << slam_vx_body
+            oss << "Wheel odom mismatch: slam_vx=" << slam_vx_for_check
                 << " wheel_vx=" << wheel_vx << " tolerance=" << tolerance
                 << " (ratio " << wheel_odom_ratio_tolerance_ * 100.0 << "%)";
+            if (transform_required)
+                oss << " [transformed " << odom_child_frame << " -> " << wheel_velocity_frame << "]";
             error_msg = oss.str();
         }
 
@@ -2426,7 +2533,7 @@ public:
                     const Eigen::Vector3d vel_body = x_curr.R.transpose() * x_curr.v;
                     slam_vx_body = vel_body.x();
                     string wheel_error;
-                    (void)evaluateWheelOdomSanity(vel_body.x(), wheel_error);
+                    (void)evaluateWheelOdomSanity(vel_body, base_link, wheel_error);
                     if (!wheel_error.empty())
                         ROS_WARN_THROTTLE(1.0, "%s", wheel_error.c_str());
                 }
