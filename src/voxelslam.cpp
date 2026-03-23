@@ -21,6 +21,8 @@ DegradeStateTracker* g_degrade_state_tracker = nullptr;
 bool g_is_initializing = true;
 // Global fixed covariance multiplier (applied before degrade-state scaling)
 double g_cov_mult = 10.0;
+// Zero published forward body-frame twist when |linear.x| falls below this threshold.
+double g_filter_twist = 0.05;
 
 class ResultOutput
 {
@@ -83,7 +85,13 @@ public:
         }
 
         // --- Linear velocity (world → body) ---
-        const Eigen::Vector3d vel_body = xc.R.transpose() * xc.v;
+        Eigen::Vector3d vel_body = xc.R.transpose() * xc.v;
+
+        // filter noise if vel is v low
+        vel_body = (vel_body.array().abs() < g_filter_twist)
+                    .select(0.0, vel_body.array())
+                    .matrix();
+
         odom_msg.twist.twist.linear.x = vel_body.x();
         odom_msg.twist.twist.linear.y = vel_body.y();
         odom_msg.twist.twist.linear.z = vel_body.z();
@@ -1078,6 +1086,7 @@ public:
         n.param<string>("General/lid_topic", lid_topic, "/livox/lidar");
         n.param<string>("General/odom_pub_topic", odom_pub_topic, "/odom");
         n.param<string>("General/imu_topic", imu_topic, "/livox/imu");
+        n.param<double>("General/filter_twist", g_filter_twist, 0.05);
         n.param<bool>("General/imu_flip_z", flip_imu_z, false);
         n.param<bool>("General/send_tf", send_tf, true);
         n.param<bool>("General/use_odom_init_tf", use_odom_init_tf, false);
