@@ -22,7 +22,7 @@ bool g_is_initializing = true;
 // Global fixed covariance multiplier (applied before degrade-state scaling)
 double g_cov_mult = 10.0;
 // Zero published forward body-frame twist when |linear.x| falls below this threshold.
-double g_filter_twist = 0.05;
+double g_filter_twist = 0.0;
 
 class ResultOutput
 {
