@@ -2,6 +2,7 @@
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
+#include "std_srvs/Trigger.h"
 #include <cstdio>
 #include <memory>
 #include <pcl/common/transforms.h>
@@ -1004,6 +1005,10 @@ public:
     ros::Time wheel_odom_last_tf_lookup_attempt_;
     std::unique_ptr<tf::TransformListener> wheel_odom_tf_listener_;
     mutex wheel_odom_mutex_;
+    std::unique_ptr<tf::TransformListener> external_odom_tf_listener_;
+    ros::ServiceServer relink_external_odom_srv_;
+    mutex manual_relink_mutex_;
+    bool manual_relink_requested_ = false;
 
     // Diagnostics
     ros::Publisher pub_diag_;
@@ -1047,6 +1052,107 @@ public:
         if (candidate == DegradeState::Reset)
             return candidate;
         return degrade_state_tracker_.update(candidate);
+    }
+
+    static Eigen::Vector2d extractRollPitch(const Eigen::Matrix3d& rotation)
+    {
+        tf::Matrix3x3 basis(rotation(0, 0), rotation(0, 1), rotation(0, 2),
+                            rotation(1, 0), rotation(1, 1), rotation(1, 2),
+                            rotation(2, 0), rotation(2, 1), rotation(2, 2));
+        double roll = 0.0;
+        double pitch = 0.0;
+        double yaw = 0.0;
+        basis.getRPY(roll, pitch, yaw);
+        return Eigen::Vector2d(roll, pitch);
+    }
+
+    static Eigen::Matrix3d makeRotationFromRollPitchYaw(double roll, double pitch,
+                                                        double yaw)
+    {
+        return (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ())
+                * Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY())
+                * Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
+                .toRotationMatrix();
+    }
+
+    bool lookupExternalOdomPositionAndYaw(Eigen::Vector3d& position,
+                                          double& yaw,
+                                          double timeout_sec,
+                                          std::string* error_message = nullptr)
+    {
+        if (!external_odom_tf_listener_)
+            external_odom_tf_listener_.reset(new tf::TransformListener());
+
+        tf::StampedTransform tf_st;
+        try
+        {
+            if (timeout_sec > 0.0)
+            {
+                external_odom_tf_listener_->waitForTransform(
+                        odom_link, base_link, ros::Time(0), ros::Duration(timeout_sec));
+            }
+            external_odom_tf_listener_->lookupTransform(odom_link, base_link,
+                                                        ros::Time(0), tf_st);
+
+            const tf::Vector3& origin = tf_st.getOrigin();
+            position = Eigen::Vector3d(origin.x(), origin.y(), origin.z());
+
+            double roll = 0.0;
+            double pitch = 0.0;
+            tf::Matrix3x3(tf_st.getRotation()).getRPY(roll, pitch, yaw);
+            return true;
+        }
+        catch (const tf::TransformException& ex)
+        {
+            if (error_message)
+                *error_message = ex.what();
+            return false;
+        }
+    }
+
+    bool syncStatePositionAndYawToExternal(IMUST& state,
+                                           const Eigen::Vector2d& roll_pitch,
+                                           double timeout_sec,
+                                           std::string* error_message = nullptr)
+    {
+        Eigen::Vector3d position;
+        double yaw = 0.0;
+        if (!lookupExternalOdomPositionAndYaw(position, yaw, timeout_sec,
+                                              error_message))
+        {
+            return false;
+        }
+
+        state.p = position;
+        state.R = makeRotationFromRollPitchYaw(roll_pitch.x(), roll_pitch.y(), yaw);
+        return true;
+    }
+
+    bool requestExternalOdomRelink(std_srvs::Trigger::Request&,
+                                   std_srvs::Trigger::Response& response)
+    {
+        lock_guard<mutex> lock(manual_relink_mutex_);
+        if (manual_relink_requested_)
+        {
+            response.success = true;
+            response.message = "External odom relink already queued";
+            return true;
+        }
+
+        manual_relink_requested_ = true;
+        response.success = true;
+        response.message = "Queued external odom relink";
+        return true;
+    }
+
+    bool consumeManualRelinkRequest()
+    {
+        lock_guard<mutex> lock(manual_relink_mutex_);
+        if (!manual_relink_requested_)
+            return false;
+
+        manual_relink_requested_ = false;
+        return true;
     }
 
     // Metrics we already compute (exposed via diagnostics)
@@ -1138,6 +1244,11 @@ public:
                                                                   << " (ratio tolerance " << wheel_odom_ratio_tolerance_
                                                                   << ", frames " << wheel_odom_violation_limit_ << ")");
         }
+
+                                    external_odom_tf_listener_.reset(new tf::TransformListener());
+                                    relink_external_odom_srv_ = n.advertiseService(
+                                        "relink_external_odom", &VOXEL_SLAM::requestExternalOdomRelink,
+                                        this);
 
         pub_odom = n.advertise<nav_msgs::Odometry>(odom_pub_topic, 10);
         if (pub_local_accumulated)
@@ -1237,29 +1348,21 @@ public:
         // Optional: initialize x_curr from current TF(odom->base_link)
         if (use_odom_init_tf)
         {
-            try
+            std::string tf_error;
+            if (syncStatePositionAndYawToExternal(x_curr, Eigen::Vector2d::Zero(),
+                                                  1.0, &tf_error))
             {
-                tf::TransformListener tf_listener;
-                tf::StampedTransform tf_st;
-                // wait briefly for transform
-                tf_listener.waitForTransform(odom_link, base_link, ros::Time(0), ros::Duration(1.0));
-                tf_listener.lookupTransform(odom_link, base_link, ros::Time(0), tf_st);
-
-                tf::Vector3 t = tf_st.getOrigin();
-                tf::Quaternion q = tf_st.getRotation();
-
-                // Note: elsewhere we publish with y,z sign flips for visualization.
-                // Here we take TF as-is in odom frame and set as initial state.
-                Eigen::Quaterniond qe(q.w(), q.x(), q.y(), q.z());
-                x_curr.R = qe.toRotationMatrix();
-                x_curr.p = Eigen::Vector3d(t.x(), t.y(), t.z());
                 x_curr.v.setZero();
-                ROS_INFO_STREAM("Initialized x_curr from TF " << odom_link << " -> " << base_link
-                                                              << ": p=[" << x_curr.p.transpose() << "]");
+                ROS_INFO_STREAM("Initialized x_curr from TF " << odom_link << " -> "
+                                                              << base_link
+                                                              << " using x/y/z/yaw: p=["
+                                                              << x_curr.p.transpose() << "]");
             }
-            catch (const tf::TransformException& ex)
+            else
             {
-                ROS_WARN_STREAM("Failed to get initial TF(" << odom_link << "->" << base_link << "): " << ex.what());
+                ROS_WARN_STREAM("Failed to get initial TF(" << odom_link << "->"
+                                                            << base_link << "): "
+                                                            << tf_error);
             }
         }
 
@@ -2073,6 +2176,8 @@ public:
 
     void system_reset(deque<sensor_msgs::Imu::Ptr>& imus)
     {
+        const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+
         reset_count_++;
         if (!pending_reset_reason_.empty())
         {
@@ -2098,26 +2203,19 @@ public:
         bool initialized_from_tf = false;
         if (use_odom_init_tf)
         {
-            try
+            std::string tf_error;
+            if (syncStatePositionAndYawToExternal(x_curr, preserved_roll_pitch,
+                                                  0.5, &tf_error))
             {
-                tf::TransformListener tf_listener;
-                tf::StampedTransform tf_st;
-                tf_listener.waitForTransform(odom_link, base_link, ros::Time(0), ros::Duration(0.5));
-                tf_listener.lookupTransform(odom_link, base_link, ros::Time(0), tf_st);
-
-                tf::Vector3 t = tf_st.getOrigin();
-                tf::Quaternion q = tf_st.getRotation();
-
-                Eigen::Quaterniond qe(q.w(), q.x(), q.y(), q.z());
-                x_curr.R = qe.toRotationMatrix();
-                x_curr.p = Eigen::Vector3d(t.x(), t.y(), t.z());
                 initialized_from_tf = true;
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
-                                               << ": p=[" << x_curr.p.transpose() << "]");
+                                               << " using x/y/z/yaw: p=["
+                                               << x_curr.p.transpose() << "]");
             }
-            catch (const tf::TransformException& ex)
+            else
             {
-                ROS_WARN_STREAM("Failed to get TF for reset, using default: " << ex.what());
+                ROS_WARN_STREAM("Failed to get TF for reset, using default: "
+                                << tf_error);
             }
         }
 
@@ -2304,27 +2402,36 @@ public:
             // If local mapping is disabled, just follow external odom TF and publish odom/path
             if (!enable_local_mapping)
             {
+                if (consumeManualRelinkRequest())
+                {
+                    std::string tf_error;
+                    const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+                    if (syncStatePositionAndYawToExternal(x_curr, preserved_roll_pitch,
+                                                          0.2, &tf_error))
+                    {
+                        x_curr.v.setZero();
+                        ROS_INFO_STREAM("Applied manual external odom relink using x/y/z/yaw: p=["
+                                        << x_curr.p.transpose() << "]");
+                    }
+                    else
+                    {
+                        ROS_WARN_STREAM("Manual external odom relink failed: "
+                                        << tf_error);
+                    }
+                }
+
                 if (use_external_odom_tf)
                 {
-                    try
+                    const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+                    if (syncStatePositionAndYawToExternal(x_curr,
+                                                          preserved_roll_pitch,
+                                                          0.0, nullptr))
                     {
-                        static tf::TransformListener tf_listener;
-                        tf::StampedTransform tf_st;
-                        tf_listener.lookupTransform(odom_link, base_link, ros::Time(0), tf_st);
-                        tf::Vector3 t = tf_st.getOrigin();
-                        tf::Quaternion q = tf_st.getRotation();
-                        Eigen::Quaterniond qe(q.w(), q.x(), q.y(), q.z());
-                        x_curr.R = qe.toRotationMatrix();
-                        x_curr.p = Eigen::Vector3d(t.x(), t.y(), t.z());
                         x_curr.v.setZero();
                         // publish odom only
                         PLV(3)
                         dummy;
                         ResultOutput::instance().pub_localtraj(dummy, 0.0, x_curr, sessionNames.size() - 1, pcl_path);
-                    }
-                    catch (const tf::TransformException&)
-                    {
-                        // ignore if TF not ready
                     }
                 }
                 sleep(0.01);
@@ -2394,6 +2501,14 @@ public:
                 }
 
                 sleep(0.001);
+                continue;
+            }
+
+            if (consumeManualRelinkRequest())
+            {
+                forceReset("Manual external odom relink requested", imus, last_pos,
+                           jour, motion_init_flag, false);
+                degrade_cnt = 0;
                 continue;
             }
 

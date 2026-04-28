@@ -19,6 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   nodelet
+  std_srvs
   std_msgs
   pcl_conversions
   pcl_ros
@@ -49,7 +50,7 @@ generate_messages(
 
 # Catkin package
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs nodelet nav_msgs roscpp rospy std_msgs
+  CATKIN_DEPENDS geometry_msgs nodelet nav_msgs roscpp rospy std_msgs std_srvs
   DEPENDS EIGEN3 PCL GTSAM
   INCLUDE_DIRS
   LIBRARIES ${PROJECT_NAME}
