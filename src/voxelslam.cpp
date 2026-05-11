@@ -2,6 +2,7 @@
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
+#include "std_srvs/Trigger.h"
 #include <cstdio>
 #include <memory>
 #include <pcl/common/transforms.h>
@@ -2376,6 +2377,24 @@ public:
             // If local mapping is disabled, just follow external odom TF and publish odom/path
             if (!enable_local_mapping)
             {
+                if (consumeManualRelinkRequest())
+                {
+                    std::string tf_error;
+                    const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+                    if (syncStatePositionAndYawToExternal(x_curr, preserved_roll_pitch,
+                                                          0.2, &tf_error))
+                    {
+                        x_curr.v.setZero();
+                        ROS_INFO_STREAM("Applied manual external odom relink using x/y/z/yaw: p=["
+                                        << x_curr.p.transpose() << "]");
+                    }
+                    else
+                    {
+                        ROS_WARN_STREAM("Manual external odom relink failed: "
+                                        << tf_error);
+                    }
+                }
+
                 if (use_external_odom_tf)
                 {
                     const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
@@ -2457,6 +2476,14 @@ public:
                 }
 
                 sleep(0.001);
+                continue;
+            }
+
+            if (consumeManualRelinkRequest())
+            {
+                forceReset("Manual external odom relink requested", imus, last_pos,
+                           jour, motion_init_flag, false);
+                degrade_cnt = 0;
                 continue;
             }
 
