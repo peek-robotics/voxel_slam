@@ -166,7 +166,20 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
   }
 
   if (!pl_ready || imu_last_time <= p_imu.pcl_end_time)
+  {
+    if (imu_last_time < 0)
+    {
+      static ros::Time _imu_warn_last(0);
+      ros::Time _now = ros::Time::now();
+      if ((_now - _imu_warn_last).toSec() >= 10.0)
+      {
+        ROS_WARN("[voxel_slam] Lidar frames arriving but no IMU received yet — "
+                 "check that the IMU topic is publishing (imu_topic=%s)", p_imu.imu_topic.c_str());
+        _imu_warn_last = _now;
+      }
+    }
     return false;
+  }
 
   mBuf.lock();
   double imu_time = imu_buf.front()->header.stamp.toSec();
