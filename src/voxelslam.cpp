@@ -223,18 +223,21 @@ public:
     }
 
     void pub_localtraj(PLV(3) & pwld, double jour, IMUST& x_curr, int cur_session,
-                       pcl::PointCloud<PointType>& pcl_path)
+                       pcl::PointCloud<PointType>& pcl_path,
+                       PVecPtr pptr = nullptr)
     {
         pub_odom_func(x_curr);
         pcl::PointCloud<PointType> pcl_send;
         pcl_send.reserve(pwld.size());
-        for (Eigen::Vector3d& pw : pwld)
+        for (size_t i = 0; i < pwld.size(); i++)
         {
-            Eigen::Vector3d pvec = pw;
+            Eigen::Vector3d pvec = pwld[i];
             PointType ap;
             ap.x = pvec.x();
             ap.y = pvec.y();
             ap.z = pvec.z();
+            if (pptr && i < pptr->size())
+                ap.intensity = (*pptr)[i].intensity;
             pcl_send.push_back(ap);
         }
         // Stamp map_scan with actual scan time (matching the odometry timestamp)
@@ -2109,7 +2112,8 @@ public:
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
         ResultOutput::instance().pub_localtraj(pwld, 0, x_curr,
-                                               sessionNames.size() - 1, pcl_path);
+                                               sessionNames.size() - 1, pcl_path,
+                                               pptr);
 
         if (win_count > 1)
         {
@@ -2599,7 +2603,8 @@ public:
                 pwld.clear();
                 pvec_update(pptr, x_curr, pwld);
                 ResultOutput::instance().pub_localtraj(
-                        pwld, jour, x_curr, sessionNames.size() - 1, pcl_path);
+                        pwld, jour, x_curr, sessionNames.size() - 1, pcl_path,
+                        pptr);
 
                 if (wheel_odom_check_enabled_)
                 {

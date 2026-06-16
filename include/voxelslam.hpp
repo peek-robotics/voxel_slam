@@ -229,6 +229,7 @@ void var_init(IMUST &ext, pcl::PointCloud<PointType> &pl_cur, PVecPtr pptr,
     PointType &ap = pl_cur[i];
     pointVar &pv = pptr->at(i);
     pv.pnt << ap.x, ap.y, ap.z;
+    pv.intensity = ap.intensity;
     calcBodyVar(pv.pnt, dept_err, beam_err, pv.var);
     pv.pnt = ext.R * pv.pnt + ext.p;
     pv.var = ext.R * pv.var * ext.R.transpose();
