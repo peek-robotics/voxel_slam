@@ -248,7 +248,8 @@ public:
         pcl::toROSMsg(pcl_send, scan_msg);
         scan_msg.header.frame_id = odom_link;
         scan_msg.header.stamp = ros::Time(x_curr.t > 0.0 ? x_curr.t : ros::Time::now().toSec());
-        pub_scan.publish(scan_msg);
+        if (pub_scan.getNumSubscribers() > 0)
+            pub_scan.publish(scan_msg);
 
         Eigen::Vector3d pcurr = x_curr.p;
 
@@ -259,7 +260,8 @@ public:
         ap.curvature = jour;
         ap.intensity = cur_session;
         pcl_path.push_back(ap);
-        pub_pl_func(pcl_path, pub_curr_path);
+        if (pub_curr_path.getNumSubscribers() > 0)
+            pub_pl_func(pcl_path, pub_curr_path);
     }
 
     void pub_localmap(int mgsize, int cur_session, vector<PVecPtr>& pvec_buf,
@@ -290,8 +292,10 @@ public:
             pcl_path[i + win_base].z = pcurr[2];
         }
 
-        pub_pl_func(pcl_path, pub_curr_path);
-        pub_pl_func(pcl_send, pub_cmap);
+        if (pub_curr_path.getNumSubscribers() > 0)
+            pub_pl_func(pcl_path, pub_curr_path);
+        if (pub_cmap.getNumSubscribers() > 0)
+            pub_pl_func(pcl_send, pub_cmap);
     }
 
     void pub_global_path(vector<vector<ScanPose*>*>& relc_bl_buf,
@@ -949,7 +953,8 @@ public:
                 pt.z = -vv[2];
                 pcl_send.push_back(pt);
             }
-        pub_pl_func(pcl_send, pub_init);
+        if (pub_init.getNumSubscribers() > 0)
+                pub_pl_func(pcl_send, pub_init);
 
         return converge_flag;
     }
@@ -2524,6 +2529,18 @@ public:
                 if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
                     continue;
 
+                // Publish full-resolution deskewed LiDAR-frame scan (before any downsampling).
+                // Consumers that need the raw point cloud (e.g. SLAM backends building submap keyframes)
+                // can subscribe to this instead of the downsampled map_scan.
+                if (pub_scan_full.getNumSubscribers() > 0)
+                {
+                    sensor_msgs::PointCloud2 full_msg;
+                    pcl::toROSMsg(*pcl_curr, full_msg);
+                    full_msg.header.frame_id = base_link;  // LiDAR frame
+                    full_msg.header.stamp = ros::Time(odom_ekf.pcl_end_time > 0.0 ? odom_ekf.pcl_end_time : ros::Time::now().toSec());
+                    pub_scan_full.publish(full_msg);
+                }
+
                 pcl::PointCloud<PointType> pl_down = *pcl_curr;
 
                 const int combined_degradation_pre = degrade_cnt + wheel_odom_violation_count_;
@@ -3751,8 +3768,8 @@ int main(int argc, char** argv)
     pub_cmap = n.advertise<sensor_msgs::PointCloud2>("map_cmap", 1);
     pub_pmap = n.advertise<sensor_msgs::PointCloud2>("map_pmap", 1);
     pub_scan = n.advertise<sensor_msgs::PointCloud2>("map_scan", 1);
+    pub_scan_full = n.advertise<sensor_msgs::PointCloud2>("map_scan_full", 1);
     pub_init = n.advertise<sensor_msgs::PointCloud2>("map_init", 1);
-    pub_test = n.advertise<sensor_msgs::PointCloud2>("map_test", 1);
     pub_curr_path = n.advertise<sensor_msgs::PointCloud2>("map_path", 1);
     pub_prev_path = n.advertise<sensor_msgs::PointCloud2>("map_true", 1);
 
@@ -3783,8 +3800,8 @@ extern "C" void voxel_slam_start(ros::NodeHandle& n)
     pub_cmap = n.advertise<sensor_msgs::PointCloud2>("map_cmap", 10);
     pub_pmap = n.advertise<sensor_msgs::PointCloud2>("map_pmap", 10);
     pub_scan = n.advertise<sensor_msgs::PointCloud2>("map_scan", 10);
+    pub_scan_full = n.advertise<sensor_msgs::PointCloud2>("map_scan_full", 10);
     pub_init = n.advertise<sensor_msgs::PointCloud2>("map_init", 10);
-    pub_test = n.advertise<sensor_msgs::PointCloud2>("map_test", 10);
     pub_curr_path = n.advertise<sensor_msgs::PointCloud2>("map_path", 10);
     pub_prev_path = n.advertise<sensor_msgs::PointCloud2>("map_true", 10);
 

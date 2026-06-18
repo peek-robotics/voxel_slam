@@ -16,6 +16,7 @@ struct pointVar
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   Eigen::Vector3d pnt;
   Eigen::Matrix3d var;
+  float intensity = 0.0f;
 };
 
 using PVec = vector<pointVar>;
