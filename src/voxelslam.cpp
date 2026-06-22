@@ -793,9 +793,14 @@ public:
         double min_eigen_value_orig = min_eigen_value;
         vector<double> eigen_value_array_orig = plane_eigen_value_thre;
 
-        min_eigen_value = 0.02;
+        // Override plane-validity thresholds for the init pass. Previously these were
+        // hard-coded to 0.02 / 0.25 which is far stricter than the runtime thresholds
+        // and caused motion_init to always fail in sparse agricultural rows.
+        // Now sourced from YAML (Initialization/motion_init_min_eigen_value and
+        // Initialization/motion_init_plane_eigen_ratio). Defaults: 0.005 / 0.5.
+        min_eigen_value = motion_init_min_eigen_value_;
         for (double& iter : plane_eigen_value_thre)
-            iter = 1.0 / 4;
+            iter = motion_init_plane_eigen_ratio_;
 
         double t0 = ros::Time::now().toSec();
         double converge_thre = 0.05;
@@ -1023,6 +1028,20 @@ public:
     mutex wheel_odom_mutex_;
     std::unique_ptr<tf::TransformListener> external_odom_tf_listener_;
 
+    // Wheel-velocity IEKF measurement update. When enabled, this adds a scalar
+    // body-X velocity residual to the IEKF so the LIO can coast through
+    // featureless regions instead of resetting. The covariance is taken from
+    // the published odom message and clamped to a [min, max] range so a
+    // misconfigured motion controller cannot either over-trust or ignore the
+    // wheel. A degeneracy-aware gain boosts the weight when the lidar is
+    // observability-starved, matching Robust-LIWO (Liu et al., 2025).
+    bool wheel_velocity_update_enabled_ = false;
+    double wheel_velocity_sigma_min_ = 0.02;   // floor on var(vx) used (m/s)^2  -> 0.14 m/s sigma
+    double wheel_velocity_sigma_max_ = 0.5;     // ceiling on var(vx) used (m/s)^2  -> 0.71 m/s sigma
+    double wheel_velocity_k_degen_ = 4.0;       // weight multiplier when lidar is fully degenerate
+    double wheel_velocity_evalue0_healthy_ = 50.0;  // evalue[0] at which lidar is "fully observable"
+    double wheel_velocity_min_speed_gate_ = 0.1;     // skip the update when |v_wheel| < this (m/s)
+
     // Diagnostics
     ros::Publisher pub_diag_;
     bool initialized_ = false;
@@ -1037,6 +1056,14 @@ public:
     double base_dept_err_ = 0.02;
     double base_beam_err_ = 0.05;
     double base_imu_coef_ = 1e-4;
+
+    // Sparse-environment tuning (exposed via YAML). These were previously hard-coded
+    // and made the LIO "fail" and motion_init fail in featureless agricultural rows.
+    double lio_success_min_eigenvalue_ = 8.0;     // was 14.0 hard-coded at line 1783
+    // The motion_init override values are file-scope (voxel_map.hpp) because
+    // motion_init is a static method of the Initialization class.
+    // motion_init_min_eigen_value_  - was 0.02  hard-coded at line 796
+    // motion_init_plane_eigen_ratio_ - was 0.25 (=1/4) hard-coded at line 798
 
     static DegradeState computeDegradeState(int combined_degradation)
     {
@@ -1191,6 +1218,25 @@ public:
         n.param<double>("WheelOdom/min_tolerance", wheel_odom_min_abs_tolerance_, 0.05);
         n.param<int>("WheelOdom/violation_frames", wheel_odom_violation_limit_, 10);
         n.param<double>("WheelOdom/timeout", wheel_odom_timeout_sec_, 0.5);
+        // Wheel-velocity IEKF update. Independent of the watchdog above;
+        // requires the watchdog to be enabled to subscribe to the wheel topic.
+        n.param<bool>("WheelOdom/velocity_update/enable",
+                      wheel_velocity_update_enabled_, false);
+        n.param<double>("WheelOdom/velocity_update/sigma_min",
+                        wheel_velocity_sigma_min_, 0.02);
+        n.param<double>("WheelOdom/velocity_update/sigma_max",
+                        wheel_velocity_sigma_max_, 0.5);
+        n.param<double>("WheelOdom/velocity_update/k_degen",
+                        wheel_velocity_k_degen_, 4.0);
+        n.param<double>("WheelOdom/velocity_update/evalue0_healthy",
+                        wheel_velocity_evalue0_healthy_, 50.0);
+        n.param<double>("WheelOdom/velocity_update/min_speed_gate",
+                        wheel_velocity_min_speed_gate_, 0.1);
+        if (wheel_velocity_update_enabled_ && !wheel_odom_check_enabled_) {
+            ROS_WARN("WheelOdom/velocity_update/enable=true but WheelOdom/enable=false; "
+                     "the wheel-velocity update will be a no-op until the wheel "
+                     "watchdog is also enabled.");
+        }
         // Local accumulated parameters
         n.param<bool>("LocalAccumulated/pub_local_accumulated", pub_local_accumulated, false);
         n.param<int>("LocalAccumulated/rolling_buffer_size", rolling_buffer_size_, 20);
@@ -1255,8 +1301,20 @@ public:
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
+        n.param<double>("Initialization/motion_init_min_eigen_value",
+                        motion_init_min_eigen_value_, 0.005);
+        n.param<double>("Initialization/motion_init_plane_eigen_ratio",
+                        motion_init_plane_eigen_ratio_, 0.5);
+        n.param<double>("Odometry/success_min_eigenvalue",
+                        lio_success_min_eigenvalue_, 8.0);
         ROS_INFO_STREAM("Motion init eigen threshold: "
                         << motion_init_eig_threshold_);
+        ROS_INFO_STREAM("Motion init min_eigen_value override: "
+                        << motion_init_min_eigen_value_);
+        ROS_INFO_STREAM("Motion init plane_eigen_ratio override: "
+                        << motion_init_plane_eigen_ratio_);
+        ROS_INFO_STREAM("LIO success min eigenvalue: "
+                        << lio_success_min_eigenvalue_);
         odom_ekf.point_notime = point_notime;
 
         // Diagnostics publisher
@@ -1780,10 +1838,128 @@ public:
         last_normal_eigenvalue_min_ = static_cast<float>(evalue[0]);
         last_normal_observability_ = (evalue[2] > 1e-9) ? static_cast<float>(evalue[0] / evalue[2]) : 0.0f;
 
-        if (evalue[0] < 14)
+        // Wheel-velocity IEKF update: anchors the LIO body-X velocity to the
+        // wheel odom after the lidar IEKF has converged. This backstops the
+        // pose during featureless regions so a single bad lidar frame does
+        // not trigger a full system reset. Degeneracy-aware weighting
+        // (Robust-LIWO): the residual is down-weighted when the lidar is
+        // observability-rich, up-weighted when it is degenerate.
+        if (wheel_velocity_update_enabled_) {
+            applyWheelVelocityUpdate();
+        }
+
+        if (evalue[0] < lio_success_min_eigenvalue_)
             return false;
         else
             return true;
+    }
+
+    // Scalar body-X velocity measurement update applied to x_curr as a
+    // post-IEKF correction. The model is:
+    //   z_wheel_x = R^T(x_curr) * v_world + n   (n ~ N(0, R))
+    // The covariance R is taken from msg.twist.covariance[0] (var(vx) as
+    // published by the motion controller) and clamped to
+    // [sigma_min, sigma_max] so a misconfigured motion controller cannot
+    // over-trust or ignore the wheel. The weight is further scaled by
+    // (1 + k_degen * (1 - observability)) where observability is in [0, 1].
+    //
+    // Returns true if the update was applied, false if it was skipped
+    // (no fresh wheel data, near-zero wheel speed, or feature disabled).
+    bool applyWheelVelocityUpdate()
+    {
+        if (!wheel_odom_check_enabled_) return false;
+
+        nav_msgs::Odometry::ConstPtr wm;
+        ros::Time wstamp;
+        {
+            lock_guard<mutex> lk(wheel_odom_mutex_);
+            wm = last_wheel_odom_msg_;
+            wstamp = last_wheel_odom_stamp_;
+        }
+        if (!wm) return false;
+        if (wheel_odom_timeout_sec_ > 0.0 &&
+            (ros::Time::now() - wstamp).toSec() > wheel_odom_timeout_sec_) {
+            return false;
+        }
+
+        // Wheel velocity in the published child frame (typically base_link /
+        // base_footprint). Take body-X as the measurement.
+        Eigen::Vector3d v_wheel_in_wheel_frame(
+            wm->twist.twist.linear.x,
+            wm->twist.twist.linear.y,
+            wm->twist.twist.linear.z);
+        Eigen::Vector3d v_wheel_in_base;
+        if (wheel_odom_transform_required_ && wheel_odom_transform_ready_) {
+            v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+        } else {
+            v_wheel_in_base = v_wheel_in_wheel_frame;
+        }
+        const double v_wheel_x = v_wheel_in_base.x();
+
+        if (std::abs(v_wheel_x) < wheel_velocity_min_speed_gate_) {
+            return false;
+        }
+
+        // Predicted body-X velocity from the IEKF state.
+        const Eigen::Vector3d v_body = x_curr.R.transpose() * x_curr.v;
+        const double v_body_x = v_body.x();
+        const double v_body_y = v_body.y();
+
+        // Residual.
+        const double r = v_body_x - v_wheel_x;
+
+        // Take the published vx variance and clamp it. This is the (c) hybrid
+        // approach: trust the motion controller's covariance within bounds.
+        double sigma2 = 0.0;
+        if (wm->twist.covariance.size() == 36) {
+            sigma2 = wm->twist.covariance[0];
+        }
+        if (sigma2 <= 0.0 || !std::isfinite(sigma2)) {
+            // No valid covariance in the message: fall back to the configured
+            // minimum so the update is still gentle.
+            sigma2 = wheel_velocity_sigma_min_;
+        }
+        sigma2 = std::max(sigma2, wheel_velocity_sigma_min_);
+        sigma2 = std::min(sigma2, wheel_velocity_sigma_max_);
+
+        // Degeneracy-aware weight: 1.0 when lidar is fully observable, up to
+        // (1 + k_degen) when lidar is fully degenerate. Skip the boost when
+        // we don't have a valid observability signal yet.
+        double obs = 1.0;
+        if (last_normal_eigenvalue_min_ > 0.0f &&
+            wheel_velocity_evalue0_healthy_ > 0.0) {
+            obs = std::max(0.0, std::min(1.0,
+                static_cast<double>(last_normal_eigenvalue_min_) /
+                wheel_velocity_evalue0_healthy_));
+        }
+        const double w = 1.0 + wheel_velocity_k_degen_ * (1.0 - obs);
+        const double R_inv = w / sigma2;
+
+        // Jacobian: 1x15 row vector in state ordering
+        //   [delta_theta(0..2) | p(3..5) | v(6..8) | bg(9..11) | ba(12..14) | g(15..17)]
+        // For body-X velocity = (R^T * v)[0] with a right-multiplied rotation
+        // perturbation: dv_body/d(delta_theta) = -[v_body]^, dv_body/dv = R^T.
+        // Body-X only -> take row 0.
+        Eigen::Matrix<double, 1, DIM> Hv;
+        Hv.setZero();
+        Hv(0, 0) = -v_body_y;          // d(v_body_x)/d(delta_theta_x)
+        Hv(0, 1) =  v_body_x;          // d(v_body_x)/d(delta_theta_y)
+        Hv(0, 2) =  0.0;               // d(v_body_x)/d(delta_theta_z)
+        Hv(0, 6) = x_curr.R(0, 0);     // d(v_body_x)/d(v_x)
+        Hv(0, 7) = x_curr.R(0, 1);     // d(v_body_x)/d(v_y)
+        Hv(0, 8) = x_curr.R(0, 2);     // d(v_body_x)/d(v_z)
+
+        // IEKF-style post-update: K = P H^T / (H P H^T + 1/R), x -= K*r,
+        // P = (I - K H) P. The state ordering matches IMUST::operator+=, so
+        // the update applies directly to x_curr (which is the post-lidar state).
+        const Eigen::Matrix<double, DIM, 1> PHt = x_curr.cov * Hv.transpose();
+        const double S = (Hv * PHt)[0] + 1.0 / R_inv;
+        if (!std::isfinite(S) || S <= 0.0) return false;
+        const Eigen::Matrix<double, DIM, 1> K = PHt / S;
+        x_curr += K * r;
+        x_curr.cov = (Eigen::Matrix<double, DIM, DIM>::Identity() - K * Hv) * x_curr.cov;
+
+        return true;
     }
 
     // The point-to-plane alignment for initialization

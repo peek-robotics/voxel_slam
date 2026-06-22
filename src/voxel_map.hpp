@@ -89,6 +89,14 @@ double voxel_size = 1.0;
 int min_ba_point = 20;
 vector<double> plane_eigen_value_thre;
 
+// motion_init() in voxelslam.cpp temporarily overrides min_eigen_value and
+// plane_eigen_value_thre while building the initial voxel map. The override
+// values are sourced from YAML (Initialization/motion_init_*). They live at
+// file scope (alongside the other tuning globals) because motion_init() is a
+// static method of the Initialization class, not a method of VOXEL_SLAM.
+double motion_init_min_eigen_value_ = 0.005;
+double motion_init_plane_eigen_ratio_ = 0.5;
+
 void Bf_var(const pointVar &pv, Eigen::Matrix<double, 9, 9> &bcov, const Eigen::Vector3d &vec)
 {
   Eigen::Matrix<double, 6, 3> Bi;
