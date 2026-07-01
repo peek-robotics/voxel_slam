@@ -110,6 +110,7 @@ public:
     int lidar_type, point_filter_num;
     double blind = 1;
     double omega_l = 3610;
+    bool filter_uncertain = false;
 
     double process(const livox_ros_driver2::CustomMsg::ConstPtr& msg, pcl::PointCloud<PointType>& pl_full)
     {
@@ -429,6 +430,9 @@ public:
         double time_head = pl_orig.points[0].timestamp;
         for (int i = 0; i < plsize; i++)
         {
+            if (filter_uncertain && pl_orig.points[i].tag != 0)
+                continue;
+
             PointType added_pt;
             added_pt.normal_x = 0;
             added_pt.normal_y = 0;

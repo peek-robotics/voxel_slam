@@ -1014,8 +1014,11 @@ public:
     double wheel_odom_timeout_sec_ = 0.5;
     int wheel_odom_violation_limit_ = 10;
     int wheel_odom_violation_count_ = 0;
+    int wheel_lateral_violation_count_ = 0;
     float last_wheel_odom_diff_ = 0.0f;
     float last_wheel_odom_tolerance_ = 0.0f;
+    float last_lateral_violation_diff_ = 0.0f;
+    float last_lateral_violation_tolerance_ = 0.0f;
     ros::Time last_wheel_odom_stamp_;
     nav_msgs::Odometry::ConstPtr last_wheel_odom_msg_;
     string wheel_odom_velocity_frame_;
@@ -1041,6 +1044,20 @@ public:
     double wheel_velocity_k_degen_ = 4.0;       // weight multiplier when lidar is fully degenerate
     double wheel_velocity_evalue0_healthy_ = 50.0;  // evalue[0] at which lidar is "fully observable"
     double wheel_velocity_min_speed_gate_ = 0.1;     // skip the update when |v_wheel| < this (m/s)
+
+    // Ackermann lateral nonholonomic constraint: v_body.y = 0. The wheel
+    // odom's linear.y is structurally 0 (motion_controller never sets it),
+    // so this anchors the LIO to the nonholonomic manifold via a post-IEKF
+    // scalar measurement update with degeneracy-aware weighting. No
+    // min_speed_gate: v_y = 0 is rigid at any speed.
+    bool nonholonomic_lateral_enabled_ = false;
+    double wheel_lateral_sigma_min_ = 0.005;   // floor  -> 0.07 m/s sigma
+    double wheel_lateral_sigma_max_ = 0.2;     // ceiling -> 0.45 m/s sigma
+    double wheel_lateral_k_degen_ = 4.0;
+    bool   lateral_require_nonwheel_degradation_ = true;
+    double lateral_violation_min_abs_tolerance_ = 0.05;  // m/s
+    double lateral_violation_ratio_tolerance_ = 0.10;    // ratio of |v_wheel_x|
+    int    wheel_lateral_violation_limit_ = 10;
 
     // Diagnostics
     ros::Publisher pub_diag_;
@@ -1087,7 +1104,7 @@ public:
     // Returns DegradeState::Reset immediately (no hysteresis).
     DegradeState updateDegradeState(int degrade_cnt)
     {
-        const int combined_degradation = degrade_cnt + wheel_odom_violation_count_;
+        const int combined_degradation = degrade_cnt + wheel_odom_violation_count_ + wheel_lateral_violation_count_;
         const DegradeState candidate = computeDegradeState(combined_degradation);
         if (candidate == DegradeState::Reset)
             return candidate;
@@ -1237,6 +1254,27 @@ public:
                      "the wheel-velocity update will be a no-op until the wheel "
                      "watchdog is also enabled.");
         }
+        n.param<bool>("WheelOdom/nonholonomic_lateral/enable",
+                      nonholonomic_lateral_enabled_, false);
+        n.param<double>("WheelOdom/nonholonomic_lateral/sigma_min",
+                        wheel_lateral_sigma_min_, 0.005);
+        n.param<double>("WheelOdom/nonholonomic_lateral/sigma_max",
+                        wheel_lateral_sigma_max_, 0.2);
+        n.param<double>("WheelOdom/nonholonomic_lateral/k_degen",
+                        wheel_lateral_k_degen_, 4.0);
+        n.param<bool>("WheelOdom/nonholonomic_lateral/require_nonwheel_degradation",
+                      lateral_require_nonwheel_degradation_, true);
+        n.param<double>("WheelOdom/nonholonomic_lateral/violation_min_abs_tolerance",
+                        lateral_violation_min_abs_tolerance_, 0.05);
+        n.param<double>("WheelOdom/nonholonomic_lateral/violation_ratio_tolerance",
+                        lateral_violation_ratio_tolerance_, 0.10);
+        n.param<int>("WheelOdom/nonholonomic_lateral/violation_limit",
+                      wheel_lateral_violation_limit_, 10);
+        if (nonholonomic_lateral_enabled_ && !wheel_odom_check_enabled_) {
+            ROS_WARN("WheelOdom/nonholonomic_lateral/enable=true but WheelOdom/enable=false; "
+                     "the lateral nonholonomic update will be a no-op until the wheel "
+                     "watchdog is also enabled.");
+        }
         // Local accumulated parameters
         n.param<bool>("LocalAccumulated/pub_local_accumulated", pub_local_accumulated, false);
         n.param<int>("LocalAccumulated/rolling_buffer_size", rolling_buffer_size_, 20);
@@ -1251,6 +1289,7 @@ public:
         n.param<int>("General/lidar_type", feat.lidar_type, 0);
         n.param<double>("General/blind", feat.blind, 0.1);
         n.param<int>("General/point_filter_num", feat.point_filter_num, 3);
+        n.param<bool>("General/filter_uncertain", feat.filter_uncertain, false);
         n.param<vector<double>>("General/extrinsic_tran", vecT, vector<double>());
         n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
         n.param<int>("General/is_save_map", is_save_map, 0);
@@ -1512,6 +1551,8 @@ public:
             lock_guard<mutex> lock(wheel_odom_mutex_);
             last_wheel_odom_diff_ = 0.0f;
             last_wheel_odom_tolerance_ = 0.0f;
+            last_lateral_violation_diff_ = 0.0f;
+            last_lateral_violation_tolerance_ = 0.0f;
             return true;
         }
 
@@ -1520,6 +1561,8 @@ public:
             lock_guard<mutex> lock(wheel_odom_mutex_);
             last_wheel_odom_diff_ = 0.0f;
             last_wheel_odom_tolerance_ = 0.0f;
+            last_lateral_violation_diff_ = 0.0f;
+            last_lateral_violation_tolerance_ = 0.0f;
             return true; // stale data, skip check
         }
 
@@ -1528,6 +1571,8 @@ public:
             lock_guard<mutex> lock(wheel_odom_mutex_);
             last_wheel_odom_diff_ = 0.0f;
             last_wheel_odom_tolerance_ = 0.0f;
+            last_lateral_violation_diff_ = 0.0f;
+            last_lateral_violation_tolerance_ = 0.0f;
             return true;
         }
 
@@ -1536,6 +1581,8 @@ public:
             lock_guard<mutex> lock(wheel_odom_mutex_);
             last_wheel_odom_diff_ = 0.0f;
             last_wheel_odom_tolerance_ = 0.0f;
+            last_lateral_violation_diff_ = 0.0f;
+            last_lateral_violation_tolerance_ = 0.0f;
             return true;
         }
 
@@ -1579,6 +1626,35 @@ public:
             error_msg = oss.str();
         }
 
+        if (nonholonomic_lateral_enabled_)
+        {
+            const double slam_vy_for_check = slam_vel_in_wheel.y();
+            const double wheel_vy = wheel_msg->twist.twist.linear.y;
+            const double tol_y = max(fabs(wheel_vx) * lateral_violation_ratio_tolerance_,
+                                    lateral_violation_min_abs_tolerance_);
+            const double diff_y = fabs(slam_vy_for_check - wheel_vy);
+
+            {
+                lock_guard<mutex> lock(wheel_odom_mutex_);
+                last_lateral_violation_diff_ = static_cast<float>(diff_y);
+                last_lateral_violation_tolerance_ = static_cast<float>(tol_y);
+            }
+
+            if (diff_y > tol_y)
+            {
+                lock_guard<mutex> lock(wheel_odom_mutex_);
+                wheel_lateral_violation_count_++;
+                if (wheel_lateral_violation_count_ > kDegradeResetThreshold)
+                    wheel_lateral_violation_count_ = kDegradeResetThreshold;
+            }
+            else
+            {
+                lock_guard<mutex> lock(wheel_odom_mutex_);
+                if (wheel_lateral_violation_count_ > 0)
+                    wheel_lateral_violation_count_--;
+            }
+        }
+
         return true;
     }
 
@@ -1610,6 +1686,7 @@ public:
         {
             lock_guard<mutex> lock(wheel_odom_mutex_);
             wheel_odom_violation_count_ = 0;
+            wheel_lateral_violation_count_ = 0;
         }
     }
 
@@ -1637,7 +1714,7 @@ public:
         msg.last_reset_reason = last_reset_reason_;
 
         msg.degrade_cnt = degrade_cnt;
-        const int combined_degradation = degrade_cnt + wheel_odom_violation_count_;
+        const int combined_degradation = degrade_cnt + wheel_odom_violation_count_ + wheel_lateral_violation_count_;
         msg.combined_degradation = combined_degradation;
         msg.degrade_state = static_cast<uint8_t>(currentDegradeState());
         msg.estimation_success = estimation_success;
@@ -1847,6 +1924,9 @@ public:
         if (wheel_velocity_update_enabled_) {
             applyWheelVelocityUpdate();
         }
+        if (nonholonomic_lateral_enabled_) {
+            applyLateralVelocityUpdate();
+        }
 
         if (evalue[0] < lio_success_min_eigenvalue_)
             return false;
@@ -1952,6 +2032,81 @@ public:
         // IEKF-style post-update: K = P H^T / (H P H^T + 1/R), x -= K*r,
         // P = (I - K H) P. The state ordering matches IMUST::operator+=, so
         // the update applies directly to x_curr (which is the post-lidar state).
+        const Eigen::Matrix<double, DIM, 1> PHt = x_curr.cov * Hv.transpose();
+        const double S = (Hv * PHt)[0] + 1.0 / R_inv;
+        if (!std::isfinite(S) || S <= 0.0) return false;
+        const Eigen::Matrix<double, DIM, 1> K = PHt / S;
+        x_curr += K * r;
+        x_curr.cov = (Eigen::Matrix<double, DIM, DIM>::Identity() - K * Hv) * x_curr.cov;
+
+        return true;
+    }
+
+    // Ackermann lateral nonholonomic constraint: v_body.y = 0. Same IEKF
+    // shape as applyWheelVelocityUpdate() but for the body-Y velocity
+    // row, with its own sigma range and k_degen. No min_speed_gate: v_y=0
+    // is rigid at any speed. Measurement is taken from the wheel message
+    // (structurally 0, but defensive against non-zero values).
+    bool applyLateralVelocityUpdate()
+    {
+        if (!nonholonomic_lateral_enabled_ || !wheel_odom_check_enabled_) return false;
+
+        nav_msgs::Odometry::ConstPtr wm;
+        ros::Time wstamp;
+        {
+            lock_guard<mutex> lk(wheel_odom_mutex_);
+            wm = last_wheel_odom_msg_;
+            wstamp = last_wheel_odom_stamp_;
+        }
+        if (!wm) return false;
+        if (wheel_odom_timeout_sec_ > 0.0 &&
+            (ros::Time::now() - wstamp).toSec() > wheel_odom_timeout_sec_) {
+            return false;
+        }
+
+        Eigen::Vector3d v_wheel_in_wheel_frame(
+            wm->twist.twist.linear.x,
+            wm->twist.twist.linear.y,
+            wm->twist.twist.linear.z);
+        Eigen::Vector3d v_wheel_in_base = v_wheel_in_wheel_frame;
+        if (wheel_odom_transform_required_ && wheel_odom_transform_ready_) {
+            v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+        }
+        const double v_wheel_y = v_wheel_in_base.y();
+        const Eigen::Vector3d v_body = x_curr.R.transpose() * x_curr.v;
+        const double v_body_x = v_body.x();
+        const double v_body_y = v_body.y();
+        const double r = v_body_y - v_wheel_y;
+
+        double sigma2 = 0.0;
+        if (wm->twist.covariance.size() == 36) {
+            sigma2 = wm->twist.covariance[7];
+        }
+        if (sigma2 <= 0.0 || !std::isfinite(sigma2)) {
+            sigma2 = wheel_lateral_sigma_min_;
+        }
+        sigma2 = std::max(sigma2, wheel_lateral_sigma_min_);
+        sigma2 = std::min(sigma2, wheel_lateral_sigma_max_);
+
+        double obs = 1.0;
+        if (last_normal_eigenvalue_min_ > 0.0f &&
+            wheel_velocity_evalue0_healthy_ > 0.0) {
+            obs = std::max(0.0, std::min(1.0,
+                static_cast<double>(last_normal_eigenvalue_min_) /
+                wheel_velocity_evalue0_healthy_));
+        }
+        const double w = 1.0 + wheel_lateral_k_degen_ * (1.0 - obs);
+        const double R_inv = w / sigma2;
+
+        Eigen::Matrix<double, 1, DIM> Hv;
+        Hv.setZero();
+        Hv(0, 0) = -v_body_y;
+        Hv(0, 1) =  v_body_x;
+        Hv(0, 2) =  0.0;
+        Hv(0, 6) = x_curr.R(1, 0);
+        Hv(0, 7) = x_curr.R(1, 1);
+        Hv(0, 8) = x_curr.R(1, 2);
+
         const Eigen::Matrix<double, DIM, 1> PHt = x_curr.cov * Hv.transpose();
         const double S = (Hv * PHt)[0] + 1.0 / R_inv;
         if (!std::isfinite(S) || S <= 0.0) return false;
@@ -2329,6 +2484,14 @@ public:
 
             if (is_success == 0)
                 return -1;
+            if (is_success == 1 && wheel_velocity_update_enabled_)
+            {
+                applyWheelVelocityUpdate();
+            }
+            if (is_success == 1 && nonholonomic_lateral_enabled_)
+            {
+                applyLateralVelocityUpdate();
+            }
             return 1;
         }
         return 0;
@@ -2337,6 +2500,12 @@ public:
     void system_reset(deque<sensor_msgs::Imu::Ptr>& imus)
     {
         const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+
+        const double prior_gnm = x_curr.g.norm();
+        const bool prior_g_trustworthy = (prior_gnm > 9.0 && prior_gnm < 10.6);
+        const Eigen::Vector3d preserved_g = prior_g_trustworthy ? x_curr.g : Eigen::Vector3d::Zero();
+        const Eigen::Vector3d preserved_bg = x_curr.bg;
+        const Eigen::Vector3d preserved_ba = x_curr.ba;
 
         reset_count_++;
         if (!pending_reset_reason_.empty())
@@ -2388,7 +2557,47 @@ public:
         odom_ekf.mean_acc.setZero();
         odom_ekf.init_num = 0;
         odom_ekf.IMU_init(imus);
-        x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
+        if (preserved_g.norm() > 0.5)
+        {
+            x_curr.g = preserved_g;
+            ROS_INFO("Reset preserved g=[%.3f %.3f %.3f] gnm=%.3f",
+                     x_curr.g.x(), x_curr.g.y(), x_curr.g.z(), x_curr.g.norm());
+        }
+        else
+        {
+            x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
+        }
+        x_curr.bg = preserved_bg;
+        x_curr.ba = preserved_ba;
+
+        x_curr.v.setZero();
+        if (wheel_odom_check_enabled_)
+        {
+            nav_msgs::Odometry::ConstPtr wm;
+            ros::Time wstamp;
+            {
+                lock_guard<mutex> lk(wheel_odom_mutex_);
+                wm = last_wheel_odom_msg_;
+                wstamp = last_wheel_odom_stamp_;
+            }
+            if (wm &&
+                (wheel_odom_timeout_sec_ <= 0.0 ||
+                 (ros::Time::now() - wstamp).toSec() <= wheel_odom_timeout_sec_))
+            {
+                Eigen::Vector3d v_wheel_in_wheel_frame(
+                        wm->twist.twist.linear.x,
+                        wm->twist.twist.linear.y,
+                        wm->twist.twist.linear.z);
+                Eigen::Vector3d v_wheel_in_base = v_wheel_in_wheel_frame;
+                if (wheel_odom_transform_required_ && wheel_odom_transform_ready_)
+                {
+                    v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+                }
+                x_curr.v = x_curr.R * v_wheel_in_base;
+                ROS_INFO("Reset seeded v=[%.3f %.3f %.3f] from wheel odom",
+                         x_curr.v.x(), x_curr.v.y(), x_curr.v.z());
+            }
+        }
 
         for (int i = 0; i < imu_pre_buf.size(); i++)
             delete imu_pre_buf[i];
@@ -2719,7 +2928,7 @@ public:
 
                 pcl::PointCloud<PointType> pl_down = *pcl_curr;
 
-                const int combined_degradation_pre = degrade_cnt + wheel_odom_violation_count_;
+                const int combined_degradation_pre = degrade_cnt + wheel_odom_violation_count_ + wheel_lateral_violation_count_;
                 const DegradeState active_degrade_state_pre = updateDegradeState(degrade_cnt);
                 if (active_degrade_state_pre == DegradeState::Reset)
                 {
@@ -2847,7 +3056,7 @@ public:
                 multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
                 t3 = ros::Time::now().toSec();
 
-                const int combined_degradation_post = degrade_cnt + wheel_odom_violation_count_;
+                const int combined_degradation_post = degrade_cnt + wheel_odom_violation_count_ + wheel_lateral_violation_count_;
                 const DegradeState active_degrade_state_post = updateDegradeState(degrade_cnt);
 
                 // Graduated Degeneration Response (based on combined degradation)
