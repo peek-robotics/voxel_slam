@@ -227,29 +227,33 @@ public:
                        PVecPtr pptr = nullptr)
     {
         pub_odom_func(x_curr);
-        pcl::PointCloud<PointType> pcl_send;
-        pcl_send.reserve(pwld.size());
-        for (size_t i = 0; i < pwld.size(); i++)
-        {
-            Eigen::Vector3d pvec = pwld[i];
-            PointType ap;
-            ap.x = pvec.x();
-            ap.y = pvec.y();
-            ap.z = pvec.z();
-            if (pptr && i < pptr->size())
-                ap.intensity = (*pptr)[i].intensity;
-            pcl_send.push_back(ap);
-        }
-        // Stamp map_scan with actual scan time (matching the odometry timestamp)
-        // so that ApproximateTime synchronizers can correctly pair both topics.
-        pcl_send.height = 1;
-        pcl_send.width = pcl_send.size();
-        sensor_msgs::PointCloud2 scan_msg;
-        pcl::toROSMsg(pcl_send, scan_msg);
-        scan_msg.header.frame_id = odom_link;
-        scan_msg.header.stamp = ros::Time(x_curr.t > 0.0 ? x_curr.t : ros::Time::now().toSec());
+        // map_scan is a viz/debug cloud; skip building and serialising it (both
+        // O(N) per scan) unless something is actually subscribed.
         if (pub_scan.getNumSubscribers() > 0)
+        {
+            pcl::PointCloud<PointType> pcl_send;
+            pcl_send.reserve(pwld.size());
+            for (size_t i = 0; i < pwld.size(); i++)
+            {
+                Eigen::Vector3d pvec = pwld[i];
+                PointType ap;
+                ap.x = pvec.x();
+                ap.y = pvec.y();
+                ap.z = pvec.z();
+                if (pptr && i < pptr->size())
+                    ap.intensity = (*pptr)[i].intensity;
+                pcl_send.push_back(ap);
+            }
+            // Stamp map_scan with actual scan time (matching the odometry
+            // timestamp) so ApproximateTime synchronizers can pair both topics.
+            pcl_send.height = 1;
+            pcl_send.width = pcl_send.size();
+            sensor_msgs::PointCloud2 scan_msg;
+            pcl::toROSMsg(pcl_send, scan_msg);
+            scan_msg.header.frame_id = odom_link;
+            scan_msg.header.stamp = ros::Time(x_curr.t > 0.0 ? x_curr.t : ros::Time::now().toSec());
             pub_scan.publish(scan_msg);
+        }
 
         Eigen::Vector3d pcurr = x_curr.p;
 
@@ -1289,6 +1293,16 @@ public:
         n.param<int>("General/lidar_type", feat.lidar_type, 0);
         n.param<double>("General/blind", feat.blind, 0.1);
         n.param<int>("General/point_filter_num", feat.point_filter_num, 3);
+        // Range (m) beyond which points are always kept regardless of
+        // point_filter_num (see Features::pass_decimation). 0 disables. Squared
+        // once here so the per-point gate is a bare comparison.
+        double decimation_full_range = 0.0;
+        n.param<double>("General/decimation_full_range", decimation_full_range, 0.0);
+        feat.decimation_full_range_sq_ = decimation_full_range * decimation_full_range;
+        if (decimation_full_range > 0.0)
+            ROS_INFO_STREAM("Range-gated decimation: keeping all points beyond "
+                            << decimation_full_range << " m (point_filter_num="
+                            << feat.point_filter_num << " applies nearer).");
         n.param<bool>("General/filter_uncertain", feat.filter_uncertain, false);
         n.param<vector<double>>("General/extrinsic_tran", vecT, vector<double>());
         n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
@@ -1773,7 +1787,10 @@ public:
 
     void PublishLocalAccumulated(const Eigen::Matrix4f& T_lidar_to_map, double stamp)
     {
-        if (!pub_local_accumulated || total_scans_stored_ == 0)
+        // Transforming + merging the rolling buffer and serialising it is the
+        // single most expensive publish; skip entirely when nobody is listening.
+        if (!pub_local_accumulated || total_scans_stored_ == 0 ||
+            pub_local_accum_cloud.getNumSubscribers() == 0)
             return;
         pcl::PointCloud<PointType> combined;
         Eigen::Matrix4f T_current_map_to_lidar = T_lidar_to_map.inverse();
@@ -1795,7 +1812,8 @@ public:
 
     void PublishLocalAccumulatedRaw(const pcl::PointCloud<PointType>::ConstPtr& scan, double stamp)
     {
-        if (!pub_local_accumulated || !scan || scan->empty())
+        if (!pub_local_accumulated || !scan || scan->empty() ||
+            pub_local_accum_cloud.getNumSubscribers() == 0)
             return;
         sensor_msgs::PointCloud2 msg;
         pcl::toROSMsg(*scan, msg);

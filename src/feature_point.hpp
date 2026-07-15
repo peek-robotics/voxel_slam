@@ -112,6 +112,27 @@ public:
     double omega_l = 3610;
     bool filter_uncertain = false;
 
+    // Range-gated decimation. Points whose squared range exceeds
+    // decimation_full_range_sq_ are ALWAYS kept, regardless of point_filter_num;
+    // nearer points are still decimated by point_filter_num. Rationale: the
+    // downstream voxel downsample (down_size) collapses dense near-field points
+    // anyway, so decimating them is free, whereas far/sparse returns survive the
+    // downsample and are exactly the points that carry the forward/lateral
+    // constraint in featureless scenes. This yields the anti-degeneracy benefit
+    // of a low point_filter_num at a fraction of the CPU cost. 0 disables
+    // (default) and reproduces the original behaviour exactly. Set from
+    // General/decimation_full_range (metres), squared once at load.
+    double decimation_full_range_sq_ = 0.0;
+
+    // Decimation gate shared by every per-lidar handler. `range_sq` is the
+    // point's squared range (x*x + y*y + z*z).
+    inline bool pass_decimation(int i, double range_sq) const
+    {
+        if (i % point_filter_num == 0)
+            return true;
+        return decimation_full_range_sq_ > 0.0 && range_sq > decimation_full_range_sq_;
+    }
+
     double process(const livox_ros_driver2::CustomMsg::ConstPtr& msg, pcl::PointCloud<PointType>& pl_full)
     {
         livox_handler(msg, pl_full);
@@ -174,12 +195,10 @@ public:
             // ap.curvature = msg->points[i].offset_time / float(1000000); // ms
             ap.curvature = msg->points[i].offset_time / float(1000000000); // s
 
-            if (i % point_filter_num == 0)
+            const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+            if (r2 > blind && pass_decimation(i, r2))
             {
-                if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z > blind)
-                {
-                    pl_full.push_back(ap);
-                }
+                pl_full.push_back(ap);
             }
         }
     }
@@ -208,12 +227,10 @@ public:
                 // ap.curvature = iter.time * 1e-6;
                 ap.curvature = iter.time;
 
-                if (i % point_filter_num == 0)
+                const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+                if (r2 > blind && pass_decimation(i, r2))
                 {
-                    if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z > blind)
-                    {
-                        pl_full.push_back(ap);
-                    }
+                    pl_full.push_back(ap);
                 }
             }
         }
@@ -246,7 +263,8 @@ public:
                     first_point = false;
                 }
 
-                if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z < blind)
+                const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+                if (r2 < blind)
                     continue;
 
                 if (yaw_angle - yaw_last > 180 && cool <= 0)
@@ -268,7 +286,7 @@ public:
                     max_ang = ap.curvature;
 
                 if (ap.curvature >= 0 && ap.curvature < 0.1)
-                    if (i % point_filter_num == 0)
+                    if (pass_decimation(i, r2))
                         pl_full.push_back(ap);
             }
 
@@ -300,12 +318,10 @@ public:
             // No per-point time: keep curvature near zero; the sync will use header stamp if point_notime=1
             ap.curvature = 0.0f;
 
-            if (i % point_filter_num == 0)
+            const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+            if (r2 > blind && pass_decimation(i, r2))
             {
-                if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z > blind)
-                {
-                    pl_full.push_back(ap);
-                }
+                pl_full.push_back(ap);
             }
         }
     }
@@ -327,12 +343,10 @@ public:
             // ap.curvature = pl_orig[i].t / float(1e6); // ms
             ap.curvature = pl_orig[i].t / float(1e9); // s
 
-            if (i % point_filter_num == 0)
+            const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+            if (r2 > blind && pass_decimation(i, r2))
             {
-                if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z > blind)
-                {
-                    pl_full.points.push_back(ap);
-                }
+                pl_full.points.push_back(ap);
             }
         }
     }
@@ -358,12 +372,11 @@ public:
             added_pt.intensity = pl_orig.points[i].intensity;
             added_pt.curvature = (pl_orig.points[i].timestamp - time_head);
 
-            if (i % point_filter_num == 0)
+            const double r2 = added_pt.x * added_pt.x +
+                              added_pt.y * added_pt.y + added_pt.z * added_pt.z;
+            if (r2 > blind && pass_decimation(i, r2))
             {
-                if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > blind)
-                {
-                    pl_full.points.push_back(added_pt);
-                }
+                pl_full.points.push_back(added_pt);
             }
         }
     }
@@ -386,12 +399,10 @@ public:
             // ap.curvature = (pl_orig[i].timestamp - t0) * float(1e3); //
             ap.curvature = (pl_orig[i].timestamp - t0);
 
-            if (i % point_filter_num == 0)
+            const double r2 = ap.x * ap.x + ap.y * ap.y + ap.z * ap.z;
+            if (r2 > blind && pass_decimation(i, r2))
             {
-                if (ap.x * ap.x + ap.y * ap.y + ap.z * ap.z > blind)
-                {
-                    pl_full.points.push_back(ap);
-                }
+                pl_full.points.push_back(ap);
             }
         }
 
@@ -444,14 +455,11 @@ public:
             added_pt.curvature = (pl_orig.points[i].timestamp - time_head) *
                                  1e-9; // curvature unit: s
 
-            if (i % point_filter_num == 0)
+            const double r2 = added_pt.x * added_pt.x +
+                              added_pt.y * added_pt.y + added_pt.z * added_pt.z;
+            if (r2 > blind * blind && pass_decimation(i, r2))
             {
-                if (added_pt.x * added_pt.x + added_pt.y * added_pt.y +
-                            added_pt.z * added_pt.z >
-                    blind * blind)
-                {
-                    pl_surf.points.push_back(added_pt);
-                }
+                pl_surf.points.push_back(added_pt);
             }
         }
     }

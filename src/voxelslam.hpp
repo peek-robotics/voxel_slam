@@ -212,9 +212,9 @@ void calcBodyVar(Eigen::Vector3d &pb, const float range_inc,
     pb[2] = 0.0001;
   float range = sqrt(pb[0] * pb[0] + pb[1] * pb[1] + pb[2] * pb[2]);
   float range_var = range_inc * range_inc;
+  const double dir_var = pow(sin(DEG2RAD(degree_inc)), 2);
   Eigen::Matrix2d direction_var;
-  direction_var << pow(sin(DEG2RAD(degree_inc)), 2), 0, 0,
-      pow(sin(DEG2RAD(degree_inc)), 2);
+  direction_var << dir_var, 0, 0, dir_var;
   Eigen::Vector3d direction(pb);
   direction.normalize();
   Eigen::Matrix3d direction_hat;
@@ -253,6 +253,7 @@ void pvec_update(PVecPtr pptr, IMUST &x_curr, PLV(3) & pwld) {
   Eigen::Matrix3d rot_var = x_curr.cov.block<3, 3>(0, 0);
   Eigen::Matrix3d tsl_var = x_curr.cov.block<3, 3>(3, 3);
 
+  pwld.reserve(pwld.size() + pptr->size());
   for (pointVar &pv : *pptr) {
     Eigen::Matrix3d phat = hat(pv.pnt);
     pv.var = x_curr.R * pv.var * x_curr.R.transpose() +
