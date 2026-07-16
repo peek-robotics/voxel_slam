@@ -80,6 +80,8 @@ target_link_libraries(${PROJECT_NAME}
   gtsam
 )
 
+add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
   include
   ${catkin_INCLUDE_DIRS}
@@ -92,5 +94,6 @@ add_library(${PROJECT_NAME}_nodelet
   src/voxel_slam_nodelet.cpp
 )
 
-add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME})
+target_link_libraries(${PROJECT_NAME}_nodelet ${PROJECT_NAME})
+add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
 
