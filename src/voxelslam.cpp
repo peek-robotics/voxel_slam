@@ -1049,6 +1049,9 @@ public:
     double wheel_velocity_k_degen_ = 4.0;       // weight multiplier when lidar is fully degenerate
     double wheel_velocity_evalue0_healthy_ = 50.0;  // evalue[0] at which lidar is "fully observable"
     double wheel_velocity_min_speed_gate_ = 0.1;     // skip the update when |v_wheel| < this (m/s)
+    double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
+    int wheel_velocity_gated_count_ = 0;
+    int wheel_lateral_gated_count_ = 0;
 
     // Ackermann lateral nonholonomic constraint: v_body.y = 0. The wheel
     // odom's linear.y is structurally 0 (motion_controller never sets it),
@@ -1059,6 +1062,7 @@ public:
     double wheel_lateral_sigma_min_ = 0.005;   // floor  -> 0.07 m/s sigma
     double wheel_lateral_sigma_max_ = 0.2;     // ceiling -> 0.45 m/s sigma
     double wheel_lateral_k_degen_ = 4.0;
+    double wheel_lateral_nis_max_ = 25.0;
     bool   lateral_require_nonwheel_degradation_ = true;
     double lateral_violation_min_abs_tolerance_ = 0.05;  // m/s
     double lateral_violation_ratio_tolerance_ = 0.10;    // ratio of |v_wheel_x|
@@ -1254,6 +1258,8 @@ public:
                         wheel_velocity_evalue0_healthy_, 50.0);
         n.param<double>("WheelOdom/velocity_update/min_speed_gate",
                         wheel_velocity_min_speed_gate_, 0.1);
+        n.param<double>("WheelOdom/velocity_update/nis_max",
+                        wheel_velocity_nis_max_, 25.0);
         if (wheel_velocity_update_enabled_ && !wheel_odom_check_enabled_) {
             ROS_WARN("WheelOdom/velocity_update/enable=true but WheelOdom/enable=false; "
                      "the wheel-velocity update will be a no-op until the wheel "
@@ -1267,6 +1273,8 @@ public:
                         wheel_lateral_sigma_max_, 0.2);
         n.param<double>("WheelOdom/nonholonomic_lateral/k_degen",
                         wheel_lateral_k_degen_, 4.0);
+        n.param<double>("WheelOdom/nonholonomic_lateral/nis_max",
+                        wheel_lateral_nis_max_, 25.0);
         n.param<bool>("WheelOdom/nonholonomic_lateral/require_nonwheel_degradation",
                       lateral_require_nonwheel_degradation_, true);
         n.param<double>("WheelOdom/nonholonomic_lateral/violation_min_abs_tolerance",
@@ -2026,7 +2034,16 @@ public:
         const double w = 1.0 + wheel_velocity_k_degen_ * (1.0 - obs);
 
         const BodyVelocityUpdate u = computeBodyVelocityUpdate(
-            x_curr.R, x_curr.v, x_curr.cov, 0, v_wheel_x, sigma2, w);
+            x_curr.R, x_curr.v, x_curr.cov, 0, v_wheel_x, sigma2, w,
+            wheel_velocity_nis_max_);
+        if (u.gated) {
+            wheel_velocity_gated_count_++;
+            ROS_WARN_THROTTLE(5.0,
+                "Wheel velocity update gated: residual %.3f m/s, NIS %.1f "
+                "(limit %.1f), %d gated so far",
+                u.residual, u.nis, wheel_velocity_nis_max_,
+                wheel_velocity_gated_count_);
+        }
         if (!u.applied) return false;
         x_curr += u.dx;
         x_curr.cov = u.cov;
@@ -2086,7 +2103,16 @@ public:
         const double w = 1.0 + wheel_lateral_k_degen_ * (1.0 - obs);
 
         const BodyVelocityUpdate u = computeBodyVelocityUpdate(
-            x_curr.R, x_curr.v, x_curr.cov, 1, v_wheel_y, sigma2, w);
+            x_curr.R, x_curr.v, x_curr.cov, 1, v_wheel_y, sigma2, w,
+            wheel_lateral_nis_max_);
+        if (u.gated) {
+            wheel_lateral_gated_count_++;
+            ROS_WARN_THROTTLE(5.0,
+                "Lateral velocity update gated: residual %.3f m/s, NIS %.1f "
+                "(limit %.1f), %d gated so far",
+                u.residual, u.nis, wheel_lateral_nis_max_,
+                wheel_lateral_gated_count_);
+        }
         if (!u.applied) return false;
         x_curr += u.dx;
         x_curr.cov = u.cov;
