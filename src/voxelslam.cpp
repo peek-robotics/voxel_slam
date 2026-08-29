@@ -2644,6 +2644,13 @@ public:
                 preserved_roll_pitch = extractRollPitch(datum_correction_ * x_curr.R);
                 gravity_norm = datum_gravity_norm_;
                 level_source = "latched datum";
+                // The correction is relative to the state it was measured
+                // against, so applying it spends it. Leaving it latched lets a
+                // second reset before the next latch re-apply the same rotation
+                // to an already-levelled state, compounding the very ratchet
+                // this is meant to remove.
+                datum_correction_ = Eigen::Matrix3d::Identity();
+                datum_stamp_ = -1.0;
             }
             else if (isQuasiStatic(st, staticness_gate_, x_curr.ba, wheelSpeed()))
             {
