@@ -2576,6 +2576,11 @@ public:
         {
             x_curr.p = Eigen::Vector3d(0, 0, 30);
             markPoseDiscontinuity();
+            // That position is an internal starting point, not an estimate of
+            // where the vehicle is, so drop the anchor and stop publishing
+            // until one of the anchoring paths establishes a real pose again.
+            // Without this the node advertises a pose 30 m above the origin.
+            g_has_anchor = false;
         }
 
         odom_ekf.mean_acc.setZero();
