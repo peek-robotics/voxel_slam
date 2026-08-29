@@ -1,4 +1,5 @@
 #include "voxelslam.hpp"
+#include "velocity_update.hpp"
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
@@ -1998,14 +1999,6 @@ public:
             return false;
         }
 
-        // Predicted body-X velocity from the IEKF state.
-        const Eigen::Vector3d v_body = x_curr.R.transpose() * x_curr.v;
-        const double v_body_x = v_body.x();
-        const double v_body_y = v_body.y();
-
-        // Residual.
-        const double r = v_body_x - v_wheel_x;
-
         // Take the published vx variance and clamp it. This is the (c) hybrid
         // approach: trust the motion controller's covariance within bounds.
         double sigma2 = 0.0;
@@ -2031,31 +2024,12 @@ public:
                 wheel_velocity_evalue0_healthy_));
         }
         const double w = 1.0 + wheel_velocity_k_degen_ * (1.0 - obs);
-        const double R_inv = w / sigma2;
 
-        // Jacobian: 1x15 row vector in state ordering
-        //   [delta_theta(0..2) | p(3..5) | v(6..8) | bg(9..11) | ba(12..14) | g(15..17)]
-        // For body-X velocity = (R^T * v)[0] with a right-multiplied rotation
-        // perturbation: dv_body/d(delta_theta) = -[v_body]^, dv_body/dv = R^T.
-        // Body-X only -> take row 0.
-        Eigen::Matrix<double, 1, DIM> Hv;
-        Hv.setZero();
-        Hv(0, 0) = -v_body_y;          // d(v_body_x)/d(delta_theta_x)
-        Hv(0, 1) =  v_body_x;          // d(v_body_x)/d(delta_theta_y)
-        Hv(0, 2) =  0.0;               // d(v_body_x)/d(delta_theta_z)
-        Hv(0, 6) = x_curr.R(0, 0);     // d(v_body_x)/d(v_x)
-        Hv(0, 7) = x_curr.R(0, 1);     // d(v_body_x)/d(v_y)
-        Hv(0, 8) = x_curr.R(0, 2);     // d(v_body_x)/d(v_z)
-
-        // IEKF-style post-update: K = P H^T / (H P H^T + 1/R), x -= K*r,
-        // P = (I - K H) P. The state ordering matches IMUST::operator+=, so
-        // the update applies directly to x_curr (which is the post-lidar state).
-        const Eigen::Matrix<double, DIM, 1> PHt = x_curr.cov * Hv.transpose();
-        const double S = (Hv * PHt)[0] + 1.0 / R_inv;
-        if (!std::isfinite(S) || S <= 0.0) return false;
-        const Eigen::Matrix<double, DIM, 1> K = PHt / S;
-        x_curr += K * r;
-        x_curr.cov = (Eigen::Matrix<double, DIM, DIM>::Identity() - K * Hv) * x_curr.cov;
+        const BodyVelocityUpdate u = computeBodyVelocityUpdate(
+            x_curr.R, x_curr.v, x_curr.cov, 0, v_wheel_x, sigma2, w);
+        if (!u.applied) return false;
+        x_curr += u.dx;
+        x_curr.cov = u.cov;
 
         return true;
     }
@@ -2091,10 +2065,6 @@ public:
             v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
         }
         const double v_wheel_y = v_wheel_in_base.y();
-        const Eigen::Vector3d v_body = x_curr.R.transpose() * x_curr.v;
-        const double v_body_x = v_body.x();
-        const double v_body_y = v_body.y();
-        const double r = v_body_y - v_wheel_y;
 
         double sigma2 = 0.0;
         if (wm->twist.covariance.size() == 36) {
@@ -2114,23 +2084,12 @@ public:
                 wheel_velocity_evalue0_healthy_));
         }
         const double w = 1.0 + wheel_lateral_k_degen_ * (1.0 - obs);
-        const double R_inv = w / sigma2;
 
-        Eigen::Matrix<double, 1, DIM> Hv;
-        Hv.setZero();
-        Hv(0, 0) = -v_body_y;
-        Hv(0, 1) =  v_body_x;
-        Hv(0, 2) =  0.0;
-        Hv(0, 6) = x_curr.R(1, 0);
-        Hv(0, 7) = x_curr.R(1, 1);
-        Hv(0, 8) = x_curr.R(1, 2);
-
-        const Eigen::Matrix<double, DIM, 1> PHt = x_curr.cov * Hv.transpose();
-        const double S = (Hv * PHt)[0] + 1.0 / R_inv;
-        if (!std::isfinite(S) || S <= 0.0) return false;
-        const Eigen::Matrix<double, DIM, 1> K = PHt / S;
-        x_curr += K * r;
-        x_curr.cov = (Eigen::Matrix<double, DIM, DIM>::Identity() - K * Hv) * x_curr.cov;
+        const BodyVelocityUpdate u = computeBodyVelocityUpdate(
+            x_curr.R, x_curr.v, x_curr.cov, 1, v_wheel_y, sigma2, w);
+        if (!u.applied) return false;
+        x_curr += u.dx;
+        x_curr.cov = u.cov;
 
         return true;
     }
