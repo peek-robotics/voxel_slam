@@ -1,5 +1,6 @@
 #include "voxelslam.hpp"
 #include "velocity_update.hpp"
+#include "odom_publish_policy.hpp"
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
@@ -23,6 +24,32 @@ DegradeStateTracker* g_degrade_state_tracker = nullptr;
 bool g_is_initializing = true;
 // Global fixed covariance multiplier (applied before degrade-state scaling)
 double g_cov_mult = 10.0;
+// Set once a pose exists: the first TF seed or the first successful init.
+bool g_has_anchor = false;
+// Where the pose published for this frame came from. Values mirror LIODiag's
+// POSE_SOURCE_* constants. A pose seeded from the external transform carries
+// that transform's error rather than this estimator's, and nothing in the
+// odometry message distinguishes the two.
+enum class PoseSource : uint8_t
+{
+    None = 0,
+    Estimate = 1,
+    External = 2,
+};
+PoseSource g_pose_source = PoseSource::None;
+// Counts publishes since the last known pose discontinuity.
+int g_frames_since_discontinuity = 1 << 20;
+int g_discontinuity_frames = 2;
+double g_discontinuity_variance = 1e6;
+double g_uncertain_variance = 1e3;
+// Negative means "use the position variance", i.e. the single-variance
+// behaviour. Position and orientation are not uncertain to the same degree in
+// either absolute regime; see OdomPublishPolicy.
+double g_discontinuity_orientation_variance = -1.0;
+double g_uncertain_orientation_variance = -1.0;
+
+// Called at every point that moves the pose other than by integration.
+inline void markPoseDiscontinuity() { g_frames_since_discontinuity = 0; }
 // Zero published forward body-frame twist when |linear.x| falls below this threshold.
 double g_filter_twist = 0.0;
 
@@ -175,35 +202,26 @@ public:
                 v *= g_cov_mult;
         }
 
-        // Set high covariance during initialization or high degradation
-        bool high_uncertainty = g_is_initializing;
-        if (g_degrade_state_tracker)
-        {
-            auto state = g_degrade_state_tracker->current();
-            if (state >= DegradeState::High)
-                high_uncertainty = true;
-        }
-
-        if (high_uncertainty)
-        {
-            for (auto& v : odom_msg.pose.covariance)
-                if (v != 0.0)
-                    v = 1e3;
-            for (auto& v : odom_msg.twist.covariance)
-                if (v != 0.0)
-                    v = 1e3;
+        const DegradeState degrade_state =
+                g_degrade_state_tracker ? g_degrade_state_tracker->current()
+                                        : DegradeState::Ok;
+        const OdomPublishPolicy policy = decideOdomPublish(
+                g_has_anchor, g_is_initializing, degrade_state,
+                g_frames_since_discontinuity, g_discontinuity_frames,
+                g_discontinuity_variance, g_uncertain_variance,
+                g_discontinuity_orientation_variance,
+                g_uncertain_orientation_variance);
+        if (!policy.publish)
             return;
-        }
-        else if (g_degrade_state_tracker)
-        {
-            auto state = g_degrade_state_tracker->current();
-            if (state == DegradeState::Low || state == DegradeState::Medium)
-            {
-                double mult = (state == DegradeState::Low) ? 1e3 : 1e6;
-                for (auto& v : odom_msg.pose.covariance)
-                    v *= mult;
-            }
-        }
+        applyOdomCovariance(odom_msg.pose.covariance,
+                            policy.pose_position_absolute,
+                            policy.pose_orientation_absolute, policy.pose_scale,
+                            policy.zero_off_diagonal);
+        applyOdomCovariance(odom_msg.twist.covariance, policy.twist_absolute,
+                            policy.twist_absolute, policy.twist_scale,
+                            policy.zero_off_diagonal);
+        if (g_frames_since_discontinuity < (1 << 20))
+            g_frames_since_discontinuity++;
 
         if (send_tf)
         {
@@ -1359,6 +1377,14 @@ public:
         n.param<double>("Odometry/beam_err", beam_err, 0.05);
         n.param<double>("Odometry/voxel_size", voxel_size, 1);
         n.param<double>("Odometry/cov_mult", g_cov_mult, 1.0);
+        n.param<int>("Odometry/discontinuity_frames", g_discontinuity_frames, 2);
+        n.param<double>("Odometry/discontinuity_variance",
+                        g_discontinuity_variance, 1e6);
+        n.param<double>("Odometry/uncertain_variance", g_uncertain_variance, 1e3);
+        n.param<double>("Odometry/discontinuity_orientation_variance",
+                        g_discontinuity_orientation_variance, -1.0);
+        n.param<double>("Odometry/uncertain_orientation_variance",
+                        g_uncertain_orientation_variance, -1.0);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
@@ -1456,6 +1482,9 @@ public:
                                                   1.0, &tf_error))
             {
                 x_curr.v.setZero();
+                g_has_anchor = true;
+                g_pose_source = PoseSource::External;
+                markPoseDiscontinuity();
                 ROS_INFO_STREAM("Initialized x_curr from TF " << odom_link << " -> "
                                                               << base_link
                                                               << " using x/y/z/yaw: p=["
@@ -1729,6 +1758,14 @@ public:
 
         voxel_slam::LIODiag msg;
         msg.header.stamp = (stamp > 0.0) ? ros::Time(stamp) : ros::Time::now();
+        static_assert(static_cast<uint8_t>(PoseSource::None) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_NONE &&
+                      static_cast<uint8_t>(PoseSource::Estimate) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_ESTIMATE &&
+                      static_cast<uint8_t>(PoseSource::External) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_EXTERNAL,
+                      "PoseSource must match the LIODiag constants");
+        msg.pose_source = static_cast<uint8_t>(g_pose_source);
         msg.header.frame_id = odom_link;
 
         msg.initialized = initialized_;
@@ -2339,6 +2376,7 @@ public:
         x_curr.p = x_buf[win_count - 1].p;
         x_curr.v = dx.R * x_curr.v;
         x_curr.g = x_buf[win_count - 1].g;
+        markPoseDiscontinuity();
 
         for (int i = 0; i < win_size; i++)
             mp[i] = i;
@@ -2540,6 +2578,9 @@ public:
                                                   0.5, &tf_error))
             {
                 initialized_from_tf = true;
+                g_has_anchor = true;
+                g_pose_source = PoseSource::External;
+                markPoseDiscontinuity();
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
                                                << " using x/y/z/yaw: p=["
                                                << x_curr.p.transpose() << "]");
@@ -2555,6 +2596,13 @@ public:
         if (!initialized_from_tf)
         {
             x_curr.p = Eigen::Vector3d(0, 0, 30);
+            markPoseDiscontinuity();
+            // That position is an internal starting point, not an estimate of
+            // where the vehicle is, so drop the anchor and stop publishing
+            // until one of the anchoring paths establishes a real pose again.
+            // Without this the node advertises a pose 30 m above the origin.
+            g_has_anchor = false;
+            g_pose_source = PoseSource::None;
         }
 
         odom_ekf.mean_acc.setZero();
@@ -2782,6 +2830,9 @@ public:
                                                           0.0, nullptr))
                     {
                         x_curr.v.setZero();
+                        g_has_anchor = true;
+                        g_pose_source = PoseSource::External;
+                        markPoseDiscontinuity();
                         // publish odom only
                         PLV(3)
                         dummy;
@@ -2889,6 +2940,9 @@ public:
                     initialized_ = true;
                     estimation_success = true;
                     g_is_initializing = false;
+                    g_has_anchor = true;
+                    g_pose_source = PoseSource::Estimate;
+                    markPoseDiscontinuity();
                 }
                 else
                 {
