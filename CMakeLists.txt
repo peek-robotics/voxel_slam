@@ -97,3 +97,14 @@ add_library(${PROJECT_NAME}_nodelet
 target_link_libraries(${PROJECT_NAME}_nodelet ${PROJECT_NAME})
 add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
 
+if(CATKIN_ENABLE_TESTING)
+  # src/ before the global include path: include/ holds a stale duplicate of
+  # several headers.
+  catkin_add_gtest(test_velocity_update test/test_velocity_update.cpp)
+  target_include_directories(test_velocity_update BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_velocity_update gtest_main ${PCL_LIBRARIES})
+endif()
