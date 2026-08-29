@@ -31,6 +31,11 @@ int g_frames_since_discontinuity = 1 << 20;
 int g_discontinuity_frames = 2;
 double g_discontinuity_variance = 1e6;
 double g_uncertain_variance = 1e3;
+// Negative means "use the position variance", i.e. the single-variance
+// behaviour. Position and orientation are not uncertain to the same degree in
+// either absolute regime; see OdomPublishPolicy.
+double g_discontinuity_orientation_variance = -1.0;
+double g_uncertain_orientation_variance = -1.0;
 
 // Called at every point that moves the pose other than by integration.
 inline void markPoseDiscontinuity() { g_frames_since_discontinuity = 0; }
@@ -192,13 +197,18 @@ public:
         const OdomPublishPolicy policy = decideOdomPublish(
                 g_has_anchor, g_is_initializing, degrade_state,
                 g_frames_since_discontinuity, g_discontinuity_frames,
-                g_discontinuity_variance, g_uncertain_variance);
+                g_discontinuity_variance, g_uncertain_variance,
+                g_discontinuity_orientation_variance,
+                g_uncertain_orientation_variance);
         if (!policy.publish)
             return;
-        applyOdomCovariance(odom_msg.pose.covariance, policy.pose_absolute,
-                            policy.pose_scale, policy.zero_off_diagonal);
+        applyOdomCovariance(odom_msg.pose.covariance,
+                            policy.pose_position_absolute,
+                            policy.pose_orientation_absolute, policy.pose_scale,
+                            policy.zero_off_diagonal);
         applyOdomCovariance(odom_msg.twist.covariance, policy.twist_absolute,
-                            policy.twist_scale, policy.zero_off_diagonal);
+                            policy.twist_absolute, policy.twist_scale,
+                            policy.zero_off_diagonal);
         if (g_frames_since_discontinuity < (1 << 20))
             g_frames_since_discontinuity++;
 
@@ -1360,6 +1370,10 @@ public:
         n.param<double>("Odometry/discontinuity_variance",
                         g_discontinuity_variance, 1e6);
         n.param<double>("Odometry/uncertain_variance", g_uncertain_variance, 1e3);
+        n.param<double>("Odometry/discontinuity_orientation_variance",
+                        g_discontinuity_orientation_variance, -1.0);
+        n.param<double>("Odometry/uncertain_orientation_variance",
+                        g_uncertain_orientation_variance, -1.0);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
