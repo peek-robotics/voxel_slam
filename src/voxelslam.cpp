@@ -26,6 +26,17 @@ bool g_is_initializing = true;
 double g_cov_mult = 10.0;
 // Set once a pose exists: the first TF seed or the first successful init.
 bool g_has_anchor = false;
+// Where the pose published for this frame came from. Values mirror LIODiag's
+// POSE_SOURCE_* constants. A pose seeded from the external transform carries
+// that transform's error rather than this estimator's, and nothing in the
+// odometry message distinguishes the two.
+enum class PoseSource : uint8_t
+{
+    None = 0,
+    Estimate = 1,
+    External = 2,
+};
+PoseSource g_pose_source = PoseSource::None;
 // Counts publishes since the last known pose discontinuity.
 int g_frames_since_discontinuity = 1 << 20;
 int g_discontinuity_frames = 2;
@@ -1472,6 +1483,7 @@ public:
             {
                 x_curr.v.setZero();
                 g_has_anchor = true;
+                g_pose_source = PoseSource::External;
                 markPoseDiscontinuity();
                 ROS_INFO_STREAM("Initialized x_curr from TF " << odom_link << " -> "
                                                               << base_link
@@ -1746,6 +1758,14 @@ public:
 
         voxel_slam::LIODiag msg;
         msg.header.stamp = (stamp > 0.0) ? ros::Time(stamp) : ros::Time::now();
+        static_assert(static_cast<uint8_t>(PoseSource::None) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_NONE &&
+                      static_cast<uint8_t>(PoseSource::Estimate) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_ESTIMATE &&
+                      static_cast<uint8_t>(PoseSource::External) ==
+                              voxel_slam::LIODiag::POSE_SOURCE_EXTERNAL,
+                      "PoseSource must match the LIODiag constants");
+        msg.pose_source = static_cast<uint8_t>(g_pose_source);
         msg.header.frame_id = odom_link;
 
         msg.initialized = initialized_;
@@ -2559,6 +2579,7 @@ public:
             {
                 initialized_from_tf = true;
                 g_has_anchor = true;
+                g_pose_source = PoseSource::External;
                 markPoseDiscontinuity();
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
                                                << " using x/y/z/yaw: p=["
@@ -2581,6 +2602,7 @@ public:
             // until one of the anchoring paths establishes a real pose again.
             // Without this the node advertises a pose 30 m above the origin.
             g_has_anchor = false;
+            g_pose_source = PoseSource::None;
         }
 
         odom_ekf.mean_acc.setZero();
@@ -2809,6 +2831,7 @@ public:
                     {
                         x_curr.v.setZero();
                         g_has_anchor = true;
+                        g_pose_source = PoseSource::External;
                         markPoseDiscontinuity();
                         // publish odom only
                         PLV(3)
@@ -2918,6 +2941,7 @@ public:
                     estimation_success = true;
                     g_is_initializing = false;
                     g_has_anchor = true;
+                    g_pose_source = PoseSource::Estimate;
                     markPoseDiscontinuity();
                 }
                 else
