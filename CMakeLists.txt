@@ -115,4 +115,12 @@ if(CATKIN_ENABLE_TESTING)
     ${PCL_INCLUDE_DIRS}
   )
   target_link_libraries(test_odom_publish_policy gtest_main ${PCL_LIBRARIES})
+
+  catkin_add_gtest(test_gravity_align test/test_gravity_align.cpp)
+  target_include_directories(test_gravity_align BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_gravity_align gtest_main ${PCL_LIBRARIES})
 endif()

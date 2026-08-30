@@ -1,6 +1,7 @@
 #include "voxelslam.hpp"
 #include "velocity_update.hpp"
 #include "odom_publish_policy.hpp"
+#include "gravity_align.hpp"
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
@@ -696,12 +697,10 @@ public:
         if (n0[2] < 0)
             n1[2] = -1;
 
-        Eigen::Vector3d rotvec = n0.cross(n1);
-        double rnorm = rotvec.norm();
-        rotvec = rotvec / rnorm;
-
-        Eigen::AngleAxisd angaxis(asin(rnorm), rotvec);
-        Eigen::Matrix3d rot = angaxis.matrix();
+        // n0 and n1 are parallel whenever gravity is already vertical, which is
+        // the normal case after a previous alignment; building the axis as
+        // (n0 x n1) / |n0 x n1| is 0/0 there.
+        Eigen::Matrix3d rot = rotationBetween(n0, n1);
         g0 = rot * g0;
 
         Eigen::Vector3d p0 = xs[0].p;
@@ -1067,6 +1066,20 @@ public:
     double wheel_velocity_k_degen_ = 4.0;       // weight multiplier when lidar is fully degenerate
     double wheel_velocity_evalue0_healthy_ = 50.0;  // evalue[0] at which lidar is "fully observable"
     double wheel_velocity_min_speed_gate_ = 0.1;     // skip the update when |v_wheel| < this (m/s)
+    // Rolling accelerometer/gyro window used to latch a gravity datum while
+    // the vehicle is at rest. One scan's worth of IMU is far too short to
+    // support a quasi-static claim.
+    std::vector<Eigen::Vector3d> imu_level_acc_, imu_level_gyr_;
+    std::vector<double> imu_level_time_;
+    double level_window_sec_ = 1.0;
+    bool level_from_gravity_ = true;
+    double datum_max_age_s_ = 120.0;
+    double max_preserved_tilt_ = 3.0 * M_PI / 180.0;
+    StaticnessGate staticness_gate_;
+    Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
+    double datum_stamp_ = -1.0;
+    double datum_gravity_norm_ = G_m_s2;
+
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
     int wheel_lateral_gated_count_ = 0;
@@ -1385,6 +1398,18 @@ public:
                         g_discontinuity_orientation_variance, -1.0);
         n.param<double>("Odometry/uncertain_orientation_variance",
                         g_uncertain_orientation_variance, -1.0);
+        n.param<bool>("Reset/level_from_gravity", level_from_gravity_, true);
+        n.param<double>("Reset/level_window_sec", level_window_sec_, 1.0);
+        n.param<double>("Reset/datum_max_age_sec", datum_max_age_s_, 120.0);
+        double max_preserved_tilt_deg = 3.0;
+        n.param<double>("Reset/max_preserved_tilt_deg", max_preserved_tilt_deg, 3.0);
+        max_preserved_tilt_ = max_preserved_tilt_deg * M_PI / 180.0;
+        n.param<double>("Reset/staticness_gyro_rms_max", staticness_gate_.gyro_rms_max, 0.15);
+        n.param<double>("Reset/staticness_acc_dev_rms_max",
+                        staticness_gate_.acc_dev_rms_max, 1.0);
+        n.param<int>("Reset/staticness_min_samples",
+                     staticness_gate_.min_samples, 100);
+        n.param<double>("Reset/staticness_speed_max", staticness_gate_.speed_max, 0.05);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
@@ -2009,6 +2034,64 @@ public:
     //
     // Returns true if the update was applied, false if it was skipped
     // (no fresh wheel data, near-zero wheel speed, or feature disabled).
+    // Vehicle speed from the wheel, or a large value when it is unavailable so
+    // that the staticness test fails closed.
+    double wheelSpeed()
+    {
+        if (!wheel_odom_check_enabled_) return 1e3;
+        nav_msgs::Odometry::ConstPtr wm;
+        {
+            lock_guard<mutex> lk(wheel_odom_mutex_);
+            wm = last_wheel_odom_msg_;
+        }
+        if (!wm) return 1e3;
+        return wm->twist.twist.linear.x;
+    }
+
+    // Appends one scan's IMU to the rolling levelling window and drops
+    // anything older than level_window_sec_.
+    void updateLevelWindow(const deque<sensor_msgs::Imu::Ptr>& imus)
+    {
+        for (const sensor_msgs::Imu::Ptr& m : imus)
+        {
+            imu_level_time_.push_back(m->header.stamp.toSec());
+            imu_level_acc_.push_back(Eigen::Vector3d(m->linear_acceleration.x,
+                                                     m->linear_acceleration.y,
+                                                     m->linear_acceleration.z));
+            imu_level_gyr_.push_back(Eigen::Vector3d(m->angular_velocity.x,
+                                                     m->angular_velocity.y,
+                                                     m->angular_velocity.z));
+        }
+        if (imu_level_time_.empty()) return;
+        const double cutoff = imu_level_time_.back() - level_window_sec_;
+        size_t drop = 0;
+        while (drop < imu_level_time_.size() && imu_level_time_[drop] < cutoff)
+            drop++;
+        if (drop > 0)
+        {
+            imu_level_time_.erase(imu_level_time_.begin(), imu_level_time_.begin() + drop);
+            imu_level_acc_.erase(imu_level_acc_.begin(), imu_level_acc_.begin() + drop);
+            imu_level_gyr_.erase(imu_level_gyr_.begin(), imu_level_gyr_.begin() + drop);
+        }
+    }
+
+    // Latches the rotation that would take the current world frame onto one
+    // whose z axis is gravity, whenever the vehicle is demonstrably at rest.
+    void updateGravityDatum()
+    {
+        if (!level_from_gravity_) return;
+        const StaticnessStats st =
+                accumulateStaticness(imu_level_acc_, imu_level_gyr_, x_curr.bg);
+        if (!isQuasiStatic(st, staticness_gate_, x_curr.ba, wheelSpeed())) return;
+        const Eigen::Vector3d f_body = st.mean_acc - x_curr.ba;
+        datum_correction_ = gravityDatumCorrection(x_curr.R, f_body);
+        datum_gravity_norm_ = f_body.norm();
+        datum_stamp_ = x_curr.t;
+        const Eigen::AngleAxisd aa(datum_correction_);
+        ROS_INFO_THROTTLE(30.0, "Gravity datum latched: map tilt %.2f deg, |g| %.3f",
+                          aa.angle() * 57.2957795, datum_gravity_norm_);
+    }
+
     bool applyWheelVelocityUpdate()
     {
         if (!wheel_odom_check_enabled_) return false;
@@ -2540,11 +2623,59 @@ public:
 
     void system_reset(deque<sensor_msgs::Imu::Ptr>& imus)
     {
-        const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
+        // Roll and pitch must not be carried across from the state that just
+        // failed, or every reset ratchets in whatever tilt the previous session
+        // drifted to. Prefer a datum latched while the vehicle was at rest,
+        // then a fresh level if it happens to be at rest now, and only then the
+        // previous attitude, clamped.
+        const Eigen::Vector2d prior_roll_pitch = extractRollPitch(x_curr.R);
+        Eigen::Vector2d preserved_roll_pitch = prior_roll_pitch;
+        double gravity_norm = G_m_s2;
+        const char* level_source = "preserved";
 
+        if (level_from_gravity_)
+        {
+            const StaticnessStats st =
+                    accumulateStaticness(imu_level_acc_, imu_level_gyr_, x_curr.bg);
+            const bool datum_fresh =
+                    datum_stamp_ > 0.0 && (x_curr.t - datum_stamp_) <= datum_max_age_s_;
+            if (datum_fresh)
+            {
+                preserved_roll_pitch = extractRollPitch(datum_correction_ * x_curr.R);
+                gravity_norm = datum_gravity_norm_;
+                level_source = "latched datum";
+                // The correction is relative to the state it was measured
+                // against, so applying it spends it. Leaving it latched lets a
+                // second reset before the next latch re-apply the same rotation
+                // to an already-levelled state, compounding the very ratchet
+                // this is meant to remove.
+                datum_correction_ = Eigen::Matrix3d::Identity();
+                datum_stamp_ = -1.0;
+            }
+            else if (isQuasiStatic(st, staticness_gate_, x_curr.ba, wheelSpeed()))
+            {
+                const Eigen::Vector3d f_body = st.mean_acc - x_curr.ba;
+                preserved_roll_pitch = levelFromSpecificForce(f_body);
+                gravity_norm = f_body.norm();
+                level_source = "fresh accelerometer";
+            }
+            else
+            {
+                for (int i = 0; i < 2; i++)
+                    preserved_roll_pitch[i] = std::max(-max_preserved_tilt_,
+                            std::min(max_preserved_tilt_, preserved_roll_pitch[i]));
+                level_source = "preserved, clamped";
+            }
+        }
         const double prior_gnm = x_curr.g.norm();
-        const bool prior_g_trustworthy = (prior_gnm > 9.0 && prior_gnm < 10.6);
-        const Eigen::Vector3d preserved_g = prior_g_trustworthy ? x_curr.g : Eigen::Vector3d::Zero();
+        if (prior_gnm > 9.0 && prior_gnm < 10.6 && gravity_norm == G_m_s2)
+            gravity_norm = prior_gnm;
+        ROS_WARN("Reset level from %s: roll %.2f pitch %.2f deg (was %.2f %.2f)",
+                 level_source, preserved_roll_pitch.x() * 57.2957795,
+                 preserved_roll_pitch.y() * 57.2957795,
+                 prior_roll_pitch.x() * 57.2957795,
+                 prior_roll_pitch.y() * 57.2957795);
+
         const Eigen::Vector3d preserved_bg = x_curr.bg;
         const Eigen::Vector3d preserved_ba = x_curr.ba;
 
@@ -2608,16 +2739,11 @@ public:
         odom_ekf.mean_acc.setZero();
         odom_ekf.init_num = 0;
         odom_ekf.IMU_init(imus);
-        if (preserved_g.norm() > 0.5)
-        {
-            x_curr.g = preserved_g;
-            ROS_INFO("Reset preserved g=[%.3f %.3f %.3f] gnm=%.3f",
-                     x_curr.g.x(), x_curr.g.y(), x_curr.g.z(), x_curr.g.norm());
-        }
-        else
-        {
-            x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
-        }
+        // The state was just re-levelled, so gravity is vertical in the world
+        // frame by construction. Only its magnitude is carried over. The old
+        // fallback assigned a body-frame mean acceleration to this world-frame
+        // slot, which is only correct while the attitude is identity.
+        x_curr.g = Eigen::Vector3d(0.0, 0.0, -gravity_norm);
         x_curr.bg = preserved_bg;
         x_curr.ba = preserved_ba;
 
@@ -2908,6 +3034,9 @@ public:
                 sleep(0.001);
                 continue;
             }
+
+            updateLevelWindow(imus);
+            updateGravityDatum();
 
             static int first_flag = 1;
             if (first_flag)
