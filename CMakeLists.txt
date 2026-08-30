@@ -108,6 +108,14 @@ if(CATKIN_ENABLE_TESTING)
   )
   target_link_libraries(test_velocity_update gtest_main ${PCL_LIBRARIES})
 
+  catkin_add_gtest(test_reset_attempt_policy test/test_reset_attempt_policy.cpp)
+  target_include_directories(test_reset_attempt_policy BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_reset_attempt_policy gtest_main ${PCL_LIBRARIES})
+
   catkin_add_gtest(test_odom_publish_policy test/test_odom_publish_policy.cpp)
   target_include_directories(test_odom_publish_policy BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
