@@ -45,6 +45,26 @@ int32 wheel_odom_violation_count  # Increments on violations, cools off (decreme
 float32 wheel_odom_diff           # |lio_vx - wheel_vx| (m/s)
 float32 wheel_odom_tolerance      # max(|wheel_vx|*ratio, min_tol) (m/s)
 
+# ===== WHEEL VELOCITY UPDATE (If Enabled) =====
+# The innovation test the update applies, which the watchdog fields above
+# cannot show: a residual can be rejected here while the watchdog stays quiet,
+# and the two thresholds are set independently.
+# meas_var is the clamped wheel variance actually used, so the filter's own
+# contribution is innovation_var - meas_var. Without that separation there is
+# no way to tell a confident filter from a trusted measurement.
+float32 wheel_velocity_residual        # v_body.x - wheel_vx (m/s)
+float32 wheel_velocity_meas_var        # clamped var(vx) used ((m/s)^2)
+float32 wheel_velocity_innovation_var  # H P H^T + meas_var ((m/s)^2), unboosted
+float32 wheel_velocity_nis             # residual^2 / innovation_var
+bool wheel_velocity_gated              # rejected by the innovation test this frame
+int32 wheel_velocity_gated_count       # cumulative rejections
+
+# ===== MAP AND STATE UNCERTAINTY =====
+int32 voxel_map_size              # surf_map entries; 0 after a reset clears it
+float32 cov_trace_rot             # trace of the attitude block of P (rad^2)
+float32 cov_trace_pos             # trace of the position block of P (m^2)
+float32 cov_trace_vel             # trace of the velocity block of P ((m/s)^2)
+
 # ===== IMU / STATE SANITY =====
 float32 gravity_norm              # |g| estimate (m/s^2). Healthy is ~9.8
 
