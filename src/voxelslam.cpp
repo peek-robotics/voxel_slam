@@ -1113,6 +1113,13 @@ public:
 
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
+    // Last wheel-velocity update, for diagnostics. computeBodyVelocityUpdate
+    // already produces these; they were discarded except in a throttled log.
+    float last_wheel_velocity_residual_ = 0.0f;
+    float last_wheel_velocity_meas_var_ = 0.0f;
+    float last_wheel_velocity_innovation_var_ = 0.0f;
+    float last_wheel_velocity_nis_ = 0.0f;
+    bool last_wheel_velocity_gated_ = false;
     int wheel_lateral_gated_count_ = 0;
 
     // Ackermann lateral nonholonomic constraint: v_body.y = 0. The wheel
@@ -1856,6 +1863,21 @@ public:
         msg.wheel_odom_diff = last_wheel_odom_diff_;
         msg.wheel_odom_tolerance = last_wheel_odom_tolerance_;
 
+        msg.wheel_velocity_residual = last_wheel_velocity_residual_;
+        msg.wheel_velocity_meas_var = last_wheel_velocity_meas_var_;
+        msg.wheel_velocity_innovation_var = last_wheel_velocity_innovation_var_;
+        msg.wheel_velocity_nis = last_wheel_velocity_nis_;
+        msg.wheel_velocity_gated = last_wheel_velocity_gated_;
+        msg.wheel_velocity_gated_count = wheel_velocity_gated_count_;
+
+        // The error state is [dtheta | p | v | bg | ba], so the three blocks
+        // are at 0, 3 and 6. Read on the odometry thread, which is the only
+        // writer of surf_map.
+        msg.voxel_map_size = static_cast<int>(surf_map.size());
+        msg.cov_trace_rot = static_cast<float>(x_curr.cov.block<3, 3>(0, 0).trace());
+        msg.cov_trace_pos = static_cast<float>(x_curr.cov.block<3, 3>(3, 3).trace());
+        msg.cov_trace_vel = static_cast<float>(x_curr.cov.block<3, 3>(6, 6).trace());
+
         msg.gravity_norm = static_cast<float>(x_curr.g.norm());
 
         // // Covariance adaptation and Hessian-based degeneracy are not currently implemented
@@ -2197,6 +2219,11 @@ public:
         const BodyVelocityUpdate u = computeBodyVelocityUpdate(
             x_curr.R, x_curr.v, x_curr.cov, 0, v_wheel_x, sigma2, w,
             wheel_velocity_nis_max_);
+        last_wheel_velocity_residual_ = static_cast<float>(u.residual);
+        last_wheel_velocity_meas_var_ = static_cast<float>(sigma2);
+        last_wheel_velocity_innovation_var_ = static_cast<float>(u.innovation_var);
+        last_wheel_velocity_nis_ = static_cast<float>(u.nis);
+        last_wheel_velocity_gated_ = u.gated;
         if (u.gated) {
             wheel_velocity_gated_count_++;
             ROS_WARN_THROTTLE(5.0,
