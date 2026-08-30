@@ -831,8 +831,14 @@ public:
         bool is_degrade = true;
         Eigen::Vector3d eigvalue;
         eigvalue.setZero();
+        // Why an attempt ended. Reported below: without it the only record of a
+        // failed initialisation is that a reset happened.
+        bool too_few_voxels = false;
+        size_t voxel_count = 0;
+        int iterations = 0;
         for (int iterCnt = 0; iterCnt < 10; iterCnt++)
         {
+            iterations = iterCnt + 1;
             if (converge_flag == 1)
             {
                 min_eigen_value = min_eigen_value_orig;
@@ -885,17 +891,21 @@ public:
                 iter->second->tras_opt(voxhess);
             }
 
-            if (voxhess.plvec_voxels.size() < 10)
+            voxel_count = voxhess.plvec_voxels.size();
+            if (voxel_count < 10)
+            {
+                too_few_voxels = true;
                 break;
+            }
             LI_BA_OptimizerGravity opt_lsv;
             vector<double> resis;
             opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, hess, 3);
             Eigen::Matrix3d nnt;
             nnt.setZero();
 
-            printf("%d: %lf %lf %lf: %lf %lf\n", iterCnt, x_buf[0].g[0],
-                   x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm(),
-                   fabs(resis[0] - resis[1]) / resis[0]);
+            ROS_DEBUG("motion_init iter %d: g=[%.3f %.3f %.3f] |g|=%.3f dres=%.4f",
+                      iterCnt, x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2],
+                      x_buf[0].g.norm(), fabs(resis[0] - resis[1]) / resis[0]);
 
             for (int i = 0; i < win_size - 1; i++)
                 delete imu_pre_buf[i];
@@ -933,11 +943,22 @@ public:
 
         x_curr = x_buf[win_size - 1];
         double gnm = x_curr.g.norm();
-        printf("gnm: %lf %lf\n", gnm, last_g_norm);
-        if (is_degrade || gnm < 9.0 || gnm > 10.6)
+        const bool converged = (converge_flag == 1);
+        const bool gravity_rejected = (gnm < 9.0 || gnm > 10.6);
+        if (is_degrade || gravity_rejected)
         {
             converge_flag = 0;
         }
+
+        const char* outcome = "accepted";
+        if (too_few_voxels)
+            outcome = "too few voxels";
+        else if (!converged)
+            outcome = "did not converge";
+        else if (is_degrade)
+            outcome = "degenerate geometry";
+        else if (gravity_rejected)
+            outcome = "gravity out of range";
         if (converge_flag == 0)
         {
             vector<OctoTree*> octos;
@@ -954,7 +975,11 @@ public:
             surf_map_slide.clear();
         }
 
-        printf("mn: %lf %lf %lf\n", eigvalue[0], eigvalue[1], eigvalue[2]);
+        ROS_INFO("motion_init %s: eig=[%.2f %.2f %.2f] (min %.2f) |g|=%.3f "
+                 "(was %.3f) voxels=%zu iters=%d",
+                 outcome, eigvalue[0], eigvalue[1], eigvalue[2],
+                 motion_init_eig_threshold_, gnm, last_g_norm, voxel_count,
+                 iterations);
         Eigen::Vector3d angv(vec_imus[0][0]->angular_velocity.x,
                              vec_imus[0][0]->angular_velocity.y,
                              vec_imus[0][0]->angular_velocity.z);
@@ -967,7 +992,7 @@ public:
         vec_imus.clear();
         beg_times.clear();
         double t1 = ros::Time::now().toSec();
-        printf("init time: %lf\n", t1 - t0);
+        ROS_DEBUG("motion_init took %.3f s", t1 - t0);
 
         // align_gravity(x_buf);
         pcl::PointCloud<PointType> pcl_send;
