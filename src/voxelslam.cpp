@@ -3,6 +3,7 @@
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
 #include "std_srvs/Trigger.h"
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <pcl/common/transforms.h>
@@ -2762,6 +2763,42 @@ public:
             iter->second->tras_opt(voxopt);
     }
 
+    // Free octree nodes that a map teardown has retired. Removing a node from
+    // surf_map only queues its children here, so the queue has to be drained
+    // somewhere or the map is dropped without its memory being returned.
+    //
+    // The budget is a time slice, not a node count. How many nodes a teardown
+    // queues depends on how deep the map had grown, so any fixed count is
+    // wrong in one direction or the other: large enough for a big map stalls
+    // the frame it lands on, small enough to be safe never catches up. A slice
+    // bounds the cost directly, which is the property actually wanted, and
+    // lets the drain rate follow the enqueue rate.
+    int release_pending_octos(double budget_ms)
+    {
+        if (octos_release.empty())
+            return 0;
+
+        const auto started = std::chrono::steady_clock::now();
+        int freed = 0;
+        while (!octos_release.empty())
+        {
+            // Check the clock every so often rather than every node: the check
+            // would otherwise cost more than the delete it guards.
+            for (int i = 0; i < 256 && !octos_release.empty(); i++)
+            {
+                delete octos_release.back();
+                octos_release.pop_back();
+                freed++;
+            }
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - started)
+                                          .count();
+            if (elapsed_ms >= budget_ms)
+                break;
+        }
+        return freed;
+    }
+
     // The main thread of odometry and local mapping
     void thd_odometry_localmapping(ros::NodeHandle& n)
     {
@@ -2822,16 +2859,8 @@ public:
             deque<sensor_msgs::Imu::Ptr> imus;
             if (!sync_packages(pcl_curr, imus, odom_ekf))
             {
-                if (octos_release.size() != 0)
+                if (release_pending_octos(50.0) != 0)
                 {
-                    int msize = octos_release.size();
-                    if (msize > 1000)
-                        msize = 1000;
-                    for (int i = 0; i < msize; i++)
-                    {
-                        delete octos_release.back();
-                        octos_release.pop_back();
-                    }
                     malloc_trim(0);
                 }
                 else if (release_flag)
@@ -2872,6 +2901,14 @@ public:
                 sleep(0.001);
                 continue;
             }
+
+            // Drain the queue while frames are arriving as well. Once the
+            // pipeline falls behind, sync_packages() always has a frame ready,
+            // the branch above stops being taken, and every subsequent teardown
+            // is queued and never freed - the more work there is, the less
+            // memory comes back. malloc_trim() stays on the idle path: walking
+            // the arenas is the expensive half, returning the nodes is not.
+            release_pending_octos(5.0);
 
             static int first_flag = 1;
             if (first_flag)
