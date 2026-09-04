@@ -56,6 +56,8 @@ deque<double> time_buf;
 // See pcl_handler() for why a bound is needed and why it is off by default.
 int max_pcl_buf = 0;
 long pcl_dropped = 0;
+// Metres of travel a voxel may go unseen before it is retired.
+int map_keep_distance = 700;
 
 double imu_last_time = -1;
 int point_notime = 0;

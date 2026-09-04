@@ -1460,6 +1460,10 @@ public:
         // 0 keeps every scan, which is what offline reprocessing wants.
         // A real-time deployment should set this; see pcl_handler().
         n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
+        // Metres of travel a voxel may go unseen before it is retired.
+        // 700 is the long-standing value. See prune_distant_voxels()
+        // for why it rarely bites in practice.
+        n.param<int>("Odometry/map_keep_distance", map_keep_distance, 700);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
         n.param<double>("Initialization/motion_init_min_eigen_value",
@@ -3086,6 +3090,35 @@ public:
         return freed;
     }
 
+    // Retire voxels the vehicle has driven away from. `jour` is distance
+    // travelled, and multi_margi() refreshes `jour` on every voxel still in the
+    // sliding window, so anything this far behind is guaranteed to have left
+    // surf_map_slide already and is safe to unlink here.
+    //
+    // The nodes go onto octos_release rather than being deleted inline, so a
+    // large prune is paid for by the same budgeted drain as everything else
+    // instead of stalling the one frame that happens to trigger it.
+    int prune_distant_voxels(double jour, int keep_dis)
+    {
+        int pruned = 0;
+        for (auto iter = surf_map.begin(); iter != surf_map.end();)
+        {
+            int dis = jour - iter->second->jour;
+            if (dis < keep_dis)
+            {
+                iter++;
+            }
+            else
+            {
+                octos_release.push_back(iter->second);
+                iter->second->tras_ptr(octos_release);
+                surf_map.erase(iter++);
+                pruned++;
+            }
+        }
+        return pruned;
+    }
+
     // The main thread of odometry and local mapping
     void thd_odometry_localmapping(ros::NodeHandle& n)
     {
@@ -3156,26 +3189,7 @@ public:
                 else if (release_flag)
                 {
                     release_flag = false;
-                    vector<OctoTree*> octos;
-                    for (auto iter = surf_map.begin(); iter != surf_map.end();)
-                    {
-                        int dis = jour - iter->second->jour;
-                        if (dis < 700)
-                        // if(dis < 200)
-                        {
-                            iter++;
-                        }
-                        else
-                        {
-                            octos.push_back(iter->second);
-                            iter->second->tras_ptr(octos);
-                            surf_map.erase(iter++);
-                        }
-                    }
-                    int ocsize = octos.size();
-                    for (int i = 0; i < ocsize; i++)
-                        delete octos[i];
-                    octos.clear();
+                    prune_distant_voxels(jour, map_keep_distance);
                     malloc_trim(0);
                 }
                 else if (sws[0].size() > 10000)
@@ -3200,6 +3214,18 @@ public:
             // the arenas is the expensive half, returning the nodes is not.
             release_pending_octos(5.0);
             trim_slwd_pool(10000, 5.0);
+
+            // The prune has to run here for the same reason the drains do. It
+            // was only ever reachable with no frame waiting, so the map stopped
+            // being trimmed at exactly the point the vehicle was covering
+            // ground faster than the odometry could keep up with - and then it
+            // grew for as long as that lasted, with nothing to bound it but the
+            // end of the drive.
+            if (release_flag)
+            {
+                release_flag = false;
+                prune_distant_voxels(jour, map_keep_distance);
+            }
 
             updateLevelWindow(imus);
             updateGravityDatum();
