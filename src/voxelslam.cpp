@@ -2799,6 +2799,36 @@ public:
         return freed;
     }
 
+    // The recycled SlideWindow pool needs the same treatment. A teardown hands
+    // the whole map's windows back at once - tens of thousands of them, each
+    // still holding the point capacity it last grew to, because clear() empties
+    // the vectors without releasing them. The pool has always had a cap, but it
+    // was only ever enforced on the same idle branch, so under backlog the cap
+    // is not enforced at all.
+    int trim_slwd_pool(size_t cap, double budget_ms)
+    {
+        if (sws[0].size() <= cap)
+            return 0;
+
+        const auto started = std::chrono::steady_clock::now();
+        int freed = 0;
+        while (sws[0].size() > cap)
+        {
+            for (int i = 0; i < 256 && sws[0].size() > cap; i++)
+            {
+                delete sws[0].back();
+                sws[0].pop_back();
+                freed++;
+            }
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - started)
+                                          .count();
+            if (elapsed_ms >= budget_ms)
+                break;
+        }
+        return freed;
+    }
+
     // The main thread of odometry and local mapping
     void thd_odometry_localmapping(ros::NodeHandle& n)
     {
@@ -2909,6 +2939,7 @@ public:
             // memory comes back. malloc_trim() stays on the idle path: walking
             // the arenas is the expensive half, returning the nodes is not.
             release_pending_octos(5.0);
+            trim_slwd_pool(10000, 5.0);
 
             static int first_flag = 1;
             if (first_flag)
