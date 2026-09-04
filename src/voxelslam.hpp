@@ -52,6 +52,9 @@ deque<sensor_msgs::Imu::Ptr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
 
+// Metres of travel a voxel may go unseen before it is retired.
+int map_keep_distance = 700;
+
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
