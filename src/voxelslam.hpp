@@ -57,6 +57,9 @@ deque<double> time_buf;
 int max_pcl_buf = 0;
 long pcl_dropped = 0;
 
+// Metres of travel a voxel may go unseen before it is retired.
+int map_keep_distance = 700;
+
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
