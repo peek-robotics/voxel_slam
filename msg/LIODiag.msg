@@ -10,6 +10,17 @@ int32 win_count                   # Sliding-window frame count (monotonic while 
 int32 reset_count                 # Total system resets performed since node start
 string last_reset_reason          # Last reset reason (empty if none)
 
+# Where the pose published for this frame came from. The odometry message
+# itself does not distinguish these, and their errors are unrelated: an
+# externally seeded pose carries the error of that transform rather than of
+# this estimator, so a consumer that treats the two alike is mismodelling one
+# of them. Stamped with the same scan time as the odometry, so the two pair
+# exactly.
+uint8 POSE_SOURCE_NONE=0      # no pose was published for this frame
+uint8 POSE_SOURCE_ESTIMATE=1  # lidar-inertial estimate
+uint8 POSE_SOURCE_EXTERNAL=2  # seeded from the external odometry transform
+uint8 pose_source
+
 # ===== DEGENERACY / HEALTH =====
 int32 degrade_cnt                 # Degeneracy counter (increments on estimation failure; decrements on stable success)
 int32 combined_degradation        # degrade_cnt + wheel_odom_violation_count
