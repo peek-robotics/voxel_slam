@@ -1,5 +1,6 @@
 #include "voxelslam.hpp"
 #include "velocity_update.hpp"
+#include "reset_attempt_policy.hpp"
 #include "odom_publish_policy.hpp"
 #include "gravity_align.hpp"
 
@@ -830,8 +831,14 @@ public:
         bool is_degrade = true;
         Eigen::Vector3d eigvalue;
         eigvalue.setZero();
+        // Why an attempt ended. Reported below: without it the only record of a
+        // failed initialisation is that a reset happened.
+        bool too_few_voxels = false;
+        size_t voxel_count = 0;
+        int iterations = 0;
         for (int iterCnt = 0; iterCnt < 10; iterCnt++)
         {
+            iterations = iterCnt + 1;
             if (converge_flag == 1)
             {
                 min_eigen_value = min_eigen_value_orig;
@@ -884,17 +891,21 @@ public:
                 iter->second->tras_opt(voxhess);
             }
 
-            if (voxhess.plvec_voxels.size() < 10)
+            voxel_count = voxhess.plvec_voxels.size();
+            if (voxel_count < 10)
+            {
+                too_few_voxels = true;
                 break;
+            }
             LI_BA_OptimizerGravity opt_lsv;
             vector<double> resis;
             opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, hess, 3);
             Eigen::Matrix3d nnt;
             nnt.setZero();
 
-            printf("%d: %lf %lf %lf: %lf %lf\n", iterCnt, x_buf[0].g[0],
-                   x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm(),
-                   fabs(resis[0] - resis[1]) / resis[0]);
+            ROS_DEBUG("motion_init iter %d: g=[%.3f %.3f %.3f] |g|=%.3f dres=%.4f",
+                      iterCnt, x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2],
+                      x_buf[0].g.norm(), fabs(resis[0] - resis[1]) / resis[0]);
 
             for (int i = 0; i < win_size - 1; i++)
                 delete imu_pre_buf[i];
@@ -932,11 +943,22 @@ public:
 
         x_curr = x_buf[win_size - 1];
         double gnm = x_curr.g.norm();
-        printf("gnm: %lf %lf\n", gnm, last_g_norm);
-        if (is_degrade || gnm < 9.0 || gnm > 10.6)
+        const bool converged = (converge_flag == 1);
+        const bool gravity_rejected = (gnm < 9.0 || gnm > 10.6);
+        if (is_degrade || gravity_rejected)
         {
             converge_flag = 0;
         }
+
+        const char* outcome = "accepted";
+        if (too_few_voxels)
+            outcome = "too few voxels";
+        else if (!converged)
+            outcome = "did not converge";
+        else if (is_degrade)
+            outcome = "degenerate geometry";
+        else if (gravity_rejected)
+            outcome = "gravity out of range";
         if (converge_flag == 0)
         {
             vector<OctoTree*> octos;
@@ -953,7 +975,11 @@ public:
             surf_map_slide.clear();
         }
 
-        printf("mn: %lf %lf %lf\n", eigvalue[0], eigvalue[1], eigvalue[2]);
+        ROS_INFO("motion_init %s: eig=[%.2f %.2f %.2f] (min %.2f) |g|=%.3f "
+                 "(was %.3f) voxels=%zu iters=%d",
+                 outcome, eigvalue[0], eigvalue[1], eigvalue[2],
+                 motion_init_eig_threshold_, gnm, last_g_norm, voxel_count,
+                 iterations);
         Eigen::Vector3d angv(vec_imus[0][0]->angular_velocity.x,
                              vec_imus[0][0]->angular_velocity.y,
                              vec_imus[0][0]->angular_velocity.z);
@@ -966,7 +992,7 @@ public:
         vec_imus.clear();
         beg_times.clear();
         double t1 = ros::Time::now().toSec();
-        printf("init time: %lf\n", t1 - t0);
+        ROS_DEBUG("motion_init took %.3f s", t1 - t0);
 
         // align_gravity(x_buf);
         pcl::PointCloud<PointType> pcl_send;
@@ -1076,12 +1102,24 @@ public:
     double datum_max_age_s_ = 120.0;
     double max_preserved_tilt_ = 3.0 * M_PI / 180.0;
     StaticnessGate staticness_gate_;
+    // A failed initialisation is retried by clearing the window; a full reset
+    // is escalated to only once the failures persist. See reset_attempt_policy.hpp.
+    ResetAttemptPolicy reset_attempt_policy_;
+    int init_escalations_ = 0;
+    double last_full_reset_time_ = -1.0;
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
 
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
+    // Last wheel-velocity update, for diagnostics. computeBodyVelocityUpdate
+    // already produces these; they were discarded except in a throttled log.
+    float last_wheel_velocity_residual_ = 0.0f;
+    float last_wheel_velocity_meas_var_ = 0.0f;
+    float last_wheel_velocity_innovation_var_ = 0.0f;
+    float last_wheel_velocity_nis_ = 0.0f;
+    bool last_wheel_velocity_gated_ = false;
     int wheel_lateral_gated_count_ = 0;
 
     // Ackermann lateral nonholonomic constraint: v_body.y = 0. The wheel
@@ -1410,6 +1448,12 @@ public:
         n.param<int>("Reset/staticness_min_samples",
                      staticness_gate_.min_samples, 100);
         n.param<double>("Reset/staticness_speed_max", staticness_gate_.speed_max, 0.05);
+        n.param<double>("Reset/escalate_after_sec",
+                        reset_attempt_policy_.escalate_after_s, 5.0);
+        n.param<double>("Reset/escalate_growth",
+                        reset_attempt_policy_.escalate_growth, 2.0);
+        n.param<double>("Reset/max_escalate_sec",
+                        reset_attempt_policy_.max_escalate_s, 60.0);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
@@ -1745,7 +1789,11 @@ public:
             ROS_WARN_STREAM(reason);
 
         pending_reset_reason_ = reason;
-        system_reset(imus);
+        // Read the scan clock before the reset touches the estimator state.
+        const double reset_time = odom_ekf.pcl_end_time;
+        system_reset(imus, ResetKind::Full);
+        last_full_reset_time_ = reset_time;
+        init_escalations_ = 0;
         last_pos = x_curr.p;
         jour = 0;
 
@@ -1814,6 +1862,21 @@ public:
         msg.wheel_odom_violation_count = wheel_odom_violation_count_;
         msg.wheel_odom_diff = last_wheel_odom_diff_;
         msg.wheel_odom_tolerance = last_wheel_odom_tolerance_;
+
+        msg.wheel_velocity_residual = last_wheel_velocity_residual_;
+        msg.wheel_velocity_meas_var = last_wheel_velocity_meas_var_;
+        msg.wheel_velocity_innovation_var = last_wheel_velocity_innovation_var_;
+        msg.wheel_velocity_nis = last_wheel_velocity_nis_;
+        msg.wheel_velocity_gated = last_wheel_velocity_gated_;
+        msg.wheel_velocity_gated_count = wheel_velocity_gated_count_;
+
+        // The error state is [dtheta | p | v | bg | ba], so the three blocks
+        // are at 0, 3 and 6. Read on the odometry thread, which is the only
+        // writer of surf_map.
+        msg.voxel_map_size = static_cast<int>(surf_map.size());
+        msg.cov_trace_rot = static_cast<float>(x_curr.cov.block<3, 3>(0, 0).trace());
+        msg.cov_trace_pos = static_cast<float>(x_curr.cov.block<3, 3>(3, 3).trace());
+        msg.cov_trace_vel = static_cast<float>(x_curr.cov.block<3, 3>(6, 6).trace());
 
         msg.gravity_norm = static_cast<float>(x_curr.g.norm());
 
@@ -2156,6 +2219,11 @@ public:
         const BodyVelocityUpdate u = computeBodyVelocityUpdate(
             x_curr.R, x_curr.v, x_curr.cov, 0, v_wheel_x, sigma2, w,
             wheel_velocity_nis_max_);
+        last_wheel_velocity_residual_ = static_cast<float>(u.residual);
+        last_wheel_velocity_meas_var_ = static_cast<float>(sigma2);
+        last_wheel_velocity_innovation_var_ = static_cast<float>(u.innovation_var);
+        last_wheel_velocity_nis_ = static_cast<float>(u.nis);
+        last_wheel_velocity_gated_ = u.gated;
         if (u.gated) {
             wheel_velocity_gated_count_++;
             ROS_WARN_THROTTLE(5.0,
@@ -2621,8 +2689,11 @@ public:
         return 0;
     }
 
-    void system_reset(deque<sensor_msgs::Imu::Ptr>& imus)
+    void system_reset(deque<sensor_msgs::Imu::Ptr>& imus,
+                      ResetKind kind = ResetKind::Full)
     {
+        const bool full = (kind == ResetKind::Full);
+
         // Roll and pitch must not be carried across from the state that just
         // failed, or every reset ratchets in whatever tilt the previous session
         // drifted to. Prefer a datum latched while the vehicle was at rest,
@@ -2633,7 +2704,17 @@ public:
         double gravity_norm = G_m_s2;
         const char* level_source = "preserved";
 
-        if (level_from_gravity_)
+        if (level_from_gravity_ && !full)
+        {
+            // A retry must not spend the datum, but it can still bound the tilt
+            // it carries forward. The clamp costs nothing and is what stops a
+            // run of retries ratcheting the attitude the way every reset used to.
+            for (int i = 0; i < 2; i++)
+                preserved_roll_pitch[i] = std::max(-max_preserved_tilt_,
+                        std::min(max_preserved_tilt_, preserved_roll_pitch[i]));
+            level_source = "preserved, clamped (retry)";
+        }
+        else if (full && level_from_gravity_)
         {
             const StaticnessStats st =
                     accumulateStaticness(imu_level_acc_, imu_level_gyr_, x_curr.bg);
@@ -2670,7 +2751,8 @@ public:
         const double prior_gnm = x_curr.g.norm();
         if (prior_gnm > 9.0 && prior_gnm < 10.6 && gravity_norm == G_m_s2)
             gravity_norm = prior_gnm;
-        ROS_WARN("Reset level from %s: roll %.2f pitch %.2f deg (was %.2f %.2f)",
+        if (full)
+            ROS_WARN("Reset level from %s: roll %.2f pitch %.2f deg (was %.2f %.2f)",
                  level_source, preserved_roll_pitch.x() * 57.2957795,
                  preserved_roll_pitch.y() * 57.2957795,
                  prior_roll_pitch.x() * 57.2957795,
@@ -2679,15 +2761,25 @@ public:
         const Eigen::Vector3d preserved_bg = x_curr.bg;
         const Eigen::Vector3d preserved_ba = x_curr.ba;
 
-        reset_count_++;
-        if (!pending_reset_reason_.empty())
+        if (full)
         {
-            last_reset_reason_ = pending_reset_reason_;
-            pending_reset_reason_.clear();
+            reset_count_++;
+            if (!pending_reset_reason_.empty())
+            {
+                last_reset_reason_ = pending_reset_reason_;
+                pending_reset_reason_.clear();
+            }
+            degrade_state_tracker_.reset(DegradeState::Ok);
         }
 
         initialized_ = false;
-        degrade_state_tracker_.reset(DegradeState::Ok);
+
+        // Previously-mapped keyframes are positioned in the frame this reset is
+        // abandoning. Cutting them into the fresh voxel map after the pose has
+        // been re-seeded from an external transform overlays two inconsistent
+        // versions of the world. forceReset already disabled that; the
+        // initialisation-failure path did not.
+        history_kfsize = 0;
 
         for (auto iter = surf_map.begin(); iter != surf_map.end(); iter++)
         {
@@ -2795,7 +2887,10 @@ public:
         win_count = 0;
         pcl_path.clear();
         pub_pl_func(pcl_path, pub_cmap);
-        ROS_WARN("Reset");
+        if (full)
+            ROS_WARN("Reset");
+        else
+            ROS_INFO("Initialisation retry: window cleared, pose re-seeded");
     }
 
     // After local BA, update the map and marginalize the points of oldest scan
@@ -3068,6 +3163,7 @@ public:
                     motion_init_flag = false;
                     initialized_ = true;
                     estimation_success = true;
+                    init_escalations_ = 0;
                     g_is_initializing = false;
                     g_has_anchor = true;
                     g_pose_source = PoseSource::Estimate;
@@ -3077,10 +3173,29 @@ public:
                 {
                     if (init == -1)
                     {
-                        ROS_INFO("Initialization %d %d %zu", init, win_count, imus.size());
+                        // A failed attempt is an expected outcome where the
+                        // geometry is momentarily poor, not a system fault. It
+                        // needs the window cleared and another attempt; a full
+                        // reset is escalated to only once the failures persist.
+                        const double now = odom_ekf.pcl_end_time;
+                        const ResetAttemptDecision attempt = decideResetAttempt(
+                                reset_attempt_policy_, init_escalations_, now,
+                                last_full_reset_time_);
 
-                        pending_reset_reason_ = "Initialization failed";
-                        system_reset(imus);
+                        ROS_INFO("Initialization %d %d %zu (%s)", init, win_count,
+                                 imus.size(), attempt.full_reset ? "reset" : "retry");
+
+                        if (attempt.full_reset)
+                        {
+                            pending_reset_reason_ = "Initialization failed";
+                            system_reset(imus, ResetKind::Full);
+                            last_full_reset_time_ = now;
+                            init_escalations_++;
+                        }
+                        else
+                        {
+                            system_reset(imus, ResetKind::InitRetry);
+                        }
                     }
 
                     double t_end = ros::Time::now().toSec();
