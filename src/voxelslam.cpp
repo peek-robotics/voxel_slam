@@ -1457,6 +1457,9 @@ public:
                         reset_attempt_policy_.max_escalate_s, 60.0);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
+        // 0 keeps every scan, which is what offline reprocessing wants.
+        // A real-time deployment should set this; see pcl_handler().
+        n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
         n.param<double>("Initialization/motion_init_min_eigen_value",

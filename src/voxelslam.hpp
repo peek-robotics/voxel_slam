@@ -52,6 +52,11 @@ deque<sensor_msgs::Imu::Ptr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
 
+// Largest number of undigested scans to hold, or <= 0 to hold every one.
+// See pcl_handler() for why a bound is needed and why it is off by default.
+int max_pcl_buf = 0;
+long pcl_dropped = 0;
+
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
@@ -131,7 +136,42 @@ template <class T> void pcl_handler(T &msg) {
   mBuf.lock();
   time_buf.push_back(t0);
   pcl_buf.push_back(pl_ptr);
+
+  // Bound the queue if asked to. Nothing else does: this is a subscriber
+  // callback so it cannot block, and the consumer only drains it while it is
+  // keeping up, so whenever the odometry falls behind the queue grows for as
+  // long as that lasts. Each entry is a full cloud, so the growth is fast -
+  // fast enough to end the process - and it is worst exactly when the odometry
+  // is least able to recover.
+  //
+  // Dropping the oldest is the only useful choice: those scans are the most
+  // stale, and everything downstream is already being fed data of that age.
+  // But it is a change to what the estimator sees, not only to memory - the
+  // next scan processed jumps forward, so the IMU span covering it widens to
+  // the gap - which is why this is off unless a bound is configured. Offline
+  // reprocessing wants every scan and should leave it off; a real-time
+  // deployment should set it, because there the alternative to dropping a
+  // stale scan is running the machine out of memory.
+  long dropped_now = 0;
+  if (max_pcl_buf > 0)
+  {
+    while ((int)pcl_buf.size() > max_pcl_buf)
+    {
+      pcl_buf.pop_front();
+      time_buf.pop_front();
+      dropped_now++;
+    }
+    pcl_dropped += dropped_now;
+  }
   mBuf.unlock();
+
+  if (dropped_now > 0)
+    ROS_WARN_THROTTLE(5.0,
+                      "[voxel_slam] odometry is behind: input queue held at %d "
+                      "scans, %ld dropped so far. The pose is being computed "
+                      "from data this far back. Set Odometry/max_pcl_buf to 0 "
+                      "to keep every scan instead.",
+                      max_pcl_buf, pcl_dropped);
 }
 
 bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
