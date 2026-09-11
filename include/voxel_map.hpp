@@ -905,8 +905,6 @@ public:
   {
     pcrs_local.resize(wdsize);
     points.resize(wdsize);
-    for(int i=0; i<wdsize; i++)
-      points[i].reserve(20);
   }
 
   void resize(int wdsize)
