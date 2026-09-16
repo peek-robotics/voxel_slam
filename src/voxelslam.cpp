@@ -1520,7 +1520,12 @@ public:
         // Voxel map decay, see map_decay_policy.hpp. decay_sec <= 0 disables
         // eviction; min_obs <= 1 matches against every voxel, which is the
         // behaviour that predates this.
-        n.param<double>("Odometry/map_decay_sec", map_decay.decay_sec, 600.0);
+        //
+        // 180 s sizes surf_map for its actual job here: the local registration
+        // reference for the IEKF and the window BA. Nothing downstream needs
+        // long-horizon map out of this node - grover_slam_backend owns loop
+        // closure and place recognition.
+        n.param<double>("Odometry/map_decay_sec", map_decay.decay_sec, 180.0);
         n.param<int>("Odometry/map_min_obs", map_decay.min_obs, 1);
         n.param<int>("Odometry/map_decay_interval", map_decay_interval_, 10);
         n.param<double>("Initialization/motion_init_eigen_threshold",
