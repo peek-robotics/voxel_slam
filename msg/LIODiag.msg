@@ -38,7 +38,15 @@ int32 match_count                 # Successful point-to-plane matches (if expose
 # ===== SIMPLE EIGENVALUE METRIC (Current) =====
 # From normal matrix accumulated from plane normals (3x3) in lio_state_estimation.
 float32 normal_eigenvalue_min     # Smallest eigenvalue (lower => more degenerate)
+float32 normal_eigenvalue_max     # Largest eigenvalue (the best-constrained direction)
 float32 normal_observability      # min/max ratio (0..1)
+# Unit eigenvector of the smallest eigenvalue, in the odom frame: the direction
+# the LiDAR could not resolve this scan. In a crop row it should point along the
+# row. The eigenvalues above say how degenerate the scan was; this says which
+# way, which is what a downstream filter needs to decide what to lean on.
+# Zero, with the flag false, when the scan produced no usable normal matrix.
+float32[3] degenerate_direction
+bool degeneracy_direction_valid
 
 # ===== WHEEL ODOMETRY WATCHDOG (If Enabled) =====
 int32 wheel_odom_violation_count  # Increments on violations, cools off (decrements) on non-violations

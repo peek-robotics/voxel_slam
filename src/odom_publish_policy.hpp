@@ -24,6 +24,23 @@ struct OdomPublishPolicy
   double pose_scale = 1.0;
   double twist_absolute = 0.0;
   double twist_scale = 1.0;
+
+  // Directional regime for the position block. When pose_position_directional
+  // is > 0 the caller writes that block as
+  //     pose_position_constrained * I + pose_position_directional * u u^T
+  // for the unit vector u along which the LiDAR cannot see - see
+  // applyDirectionalPositionCovariance(). pose_position_absolute is then 0, so
+  // the absolute pass leaves the position diagonal alone and only zeroes the
+  // off-diagonals (including the position-orientation cross terms) before this
+  // block is written over them.
+  //
+  // Why it exists: in a crop row the LiDAR is blind along the row and fine
+  // across it. Replacing the whole block with one number tells a downstream
+  // filter the across-row estimate is as bad as the along-row one, so it
+  // either throws away a good measurement or trusts a bad one. There is no
+  // third number that is right for both.
+  double pose_position_directional = 0.0;
+  double pose_position_constrained = 0.0;
 };
 
 // A pose exists from the first anchor onwards, so publish from then on and let
@@ -38,7 +55,9 @@ inline OdomPublishPolicy decideOdomPublish(
     int frames_since_discontinuity, int discontinuity_frames,
     double discontinuity_variance, double uncertain_variance,
     double discontinuity_orientation_variance = -1.0,
-    double uncertain_orientation_variance = -1.0)
+    double uncertain_orientation_variance = -1.0,
+    bool degeneracy_is_directional = false,
+    double uncertain_constrained_variance = -1.0)
 {
   OdomPublishPolicy p;
   if (!anchored)
@@ -58,12 +77,38 @@ inline OdomPublishPolicy decideOdomPublish(
 
   if (initializing || degrade >= DegradeState::High)
   {
-    p.pose_position_absolute = uncertain_variance;
     p.pose_orientation_absolute = uncertain_orientation_variance >= 0.0
                                           ? uncertain_orientation_variance
                                           : uncertain_variance;
     p.twist_absolute = uncertain_variance;
     p.zero_off_diagonal = true;
+
+    // Only the degraded case can be answered directionally, and only when the
+    // caller has established that the degeneracy really is one-sided.
+    //
+    // Initialisation is excluded on purpose: the pose is re-seeded from an
+    // external transform there, so its error is that transform's and has
+    // nothing to do with which way the LiDAR can see. Degradation reached
+    // through the wheel-odometry watchdog rather than through LiDAR geometry
+    // is excluded the same way, by the caller's `degeneracy_is_directional`
+    // - claiming confidence across the row because the *LiDAR* is healthy
+    // would be exactly wrong when the reason for distrust is elsewhere.
+    const bool directional = !initializing && degeneracy_is_directional &&
+                             uncertain_constrained_variance > 0.0 &&
+                             uncertain_constrained_variance < uncertain_variance;
+    if (directional)
+    {
+      p.pose_position_constrained = uncertain_constrained_variance;
+      // So that the total along the weak direction is uncertain_variance,
+      // i.e. the directional answer is never more pessimistic there than the
+      // isotropic one it replaces.
+      p.pose_position_directional =
+              uncertain_variance - uncertain_constrained_variance;
+    }
+    else
+    {
+      p.pose_position_absolute = uncertain_variance;
+    }
     return p;
   }
 
@@ -103,6 +148,39 @@ inline void applyOdomCovariance(Cov &cov, double absolute_linear,
   if (scale != 1.0)
     for (int k = 0; k < 36; ++k)
       cov[k] *= scale;
+}
+
+// Writes the 3x3 position block of a row-major 6x6 pose covariance as
+//     constrained * I + directional * u u^T
+// where u is `dir` normalised: `constrained` variance in every direction, plus
+// `directional` more along u. Call it after applyOdomCovariance(), which has
+// already zeroed the off-diagonals this overwrites.
+//
+// Both terms are positive semi-definite and `constrained` is required to be
+// positive, so the result is positive definite by construction. That is the
+// property the uniformly-filled block it replaces did not have: a 3x3 of one
+// repeated value is rank 1, and a partly filled one is indefinite.
+//
+// A zero-length `dir` is treated as "no direction known" and yields the
+// isotropic `constrained * I`, which is the safe reading of an absent input
+// rather than a division by zero.
+template <typename Cov>
+inline void applyDirectionalPositionCovariance(Cov &cov,
+                                               const Eigen::Vector3d &dir,
+                                               double constrained,
+                                               double directional)
+{
+  if (constrained <= 0.0)
+    return;
+
+  const double norm = dir.norm();
+  const Eigen::Vector3d u = norm > 1e-9 ? Eigen::Vector3d(dir / norm)
+                                        : Eigen::Vector3d::Zero();
+  const double extra = directional > 0.0 ? directional : 0.0;
+
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      cov[i * 6 + j] = (i == j ? constrained : 0.0) + extra * u[i] * u[j];
 }
 
 #endif // ODOM_PUBLISH_POLICY_HPP
