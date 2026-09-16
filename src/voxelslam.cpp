@@ -51,6 +51,30 @@ double g_uncertain_variance = 1e3;
 double g_discontinuity_orientation_variance = -1.0;
 double g_uncertain_orientation_variance = -1.0;
 
+// Weakest-constrained translation direction of the last LiDAR update, in the
+// odom frame, and the observability ratio that says whether calling it a
+// "direction" is meaningful at all.
+//
+// The point-to-plane Jacobian with respect to translation is the plane normal,
+// so the n*n^T accumulated in lio_state_estimation() is exactly the
+// translational information of the scan. Its weakest eigenvector is the
+// direction the LiDAR cannot resolve - along a crop row, the row. The
+// eigenvectors were already being computed and discarded; only the two scalar
+// summaries were kept.
+//
+// Written and read on the odometry thread only, like g_is_initializing and
+// g_pose_source.
+Eigen::Vector3d g_degenerate_dir = Eigen::Vector3d::Zero();
+bool g_degenerate_dir_valid = false;
+double g_degenerate_observability = 1.0;
+// The degraded covariance is answered directionally only below this ratio.
+// Above it the scan is uniformly weak rather than weak in one direction, and
+// one number is then the honest answer. <= 0 disables the directional regime.
+double g_directional_observability_max = 0.0;
+// Variance published along the two directions the LiDAR *can* see while
+// degraded. <= 0 keeps the isotropic replacement. See OdomPublishPolicy.
+double g_uncertain_constrained_variance = -1.0;
+
 // Called at every point that moves the pose other than by integration.
 inline void markPoseDiscontinuity() { g_frames_since_discontinuity = 0; }
 // Zero published forward body-frame twist when |linear.x| falls below this threshold.
@@ -208,18 +232,34 @@ public:
         const DegradeState degrade_state =
                 g_degrade_state_tracker ? g_degrade_state_tracker->current()
                                         : DegradeState::Ok;
+        // A degeneracy is worth answering directionally only when it is
+        // actually one-sided. The ratio gate keeps a uniformly weak scan, and
+        // a degrade state reached through the wheel watchdog rather than
+        // through LiDAR geometry, on the isotropic path.
+        const bool degeneracy_is_directional =
+                g_degenerate_dir_valid && g_directional_observability_max > 0.0 &&
+                g_degenerate_observability <= g_directional_observability_max;
+
         const OdomPublishPolicy policy = decideOdomPublish(
                 g_has_anchor, g_is_initializing, degrade_state,
                 g_frames_since_discontinuity, g_discontinuity_frames,
                 g_discontinuity_variance, g_uncertain_variance,
                 g_discontinuity_orientation_variance,
-                g_uncertain_orientation_variance);
+                g_uncertain_orientation_variance, degeneracy_is_directional,
+                g_uncertain_constrained_variance);
         if (!policy.publish)
             return;
         applyOdomCovariance(odom_msg.pose.covariance,
                             policy.pose_position_absolute,
                             policy.pose_orientation_absolute, policy.pose_scale,
                             policy.zero_off_diagonal);
+        // Overwrites the position block the pass above only zeroed the
+        // off-diagonals of, so it must come second.
+        if (policy.pose_position_directional > 0.0)
+            applyDirectionalPositionCovariance(odom_msg.pose.covariance,
+                                               g_degenerate_dir,
+                                               policy.pose_position_constrained,
+                                               policy.pose_position_directional);
         applyOdomCovariance(odom_msg.twist.covariance, policy.twist_absolute,
                             policy.twist_absolute, policy.twist_scale,
                             policy.zero_off_diagonal);
@@ -880,7 +920,7 @@ public:
                 }
 
                 cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld,
-                          sws[0]);
+                          sws[0], x_buf[i].t);
             }
 
             // LidarFactor voxhess(win_size);
@@ -1147,6 +1187,13 @@ public:
 
     DegradeStateTracker degrade_state_tracker_;
 
+    // Voxel map decay (map_decay_policy.hpp; thresholds live in the file-scope
+    // `map_decay`). The sweep cadence is counted in windows rather than
+    // seconds because it is the map's growth that has to be outpaced, and the
+    // map grows once per window.
+    int map_decay_interval_ = 10;
+    long map_voxels_evicted_ = 0;
+
     // Base tuning parameters (used for per-frame scaling; never modified)
     double base_down_size_ = 0.1;
     double base_dept_err_ = 0.02;
@@ -1267,7 +1314,10 @@ public:
     // Metrics we already compute (exposed via diagnostics)
     int last_match_count_ = 0;
     float last_normal_eigenvalue_min_ = 0.0f;
+    float last_normal_eigenvalue_max_ = 0.0f;
     float last_normal_observability_ = 0.0f;
+    Eigen::Vector3d last_degenerate_dir_ = Eigen::Vector3d::Zero();
+    bool last_degeneracy_valid_ = false;
 
     vector<string> sessionNames;
     string bagname, savepath;
@@ -1437,6 +1487,13 @@ public:
                         g_discontinuity_orientation_variance, -1.0);
         n.param<double>("Odometry/uncertain_orientation_variance",
                         g_uncertain_orientation_variance, -1.0);
+        // Directional degraded covariance. Off by default: it changes what the
+        // downstream filter is told during degraded operation, which wants
+        // validating against a recorded traverse before it is switched on.
+        n.param<double>("Odometry/directional_observability_max",
+                        g_directional_observability_max, 0.0);
+        n.param<double>("Odometry/uncertain_constrained_variance",
+                        g_uncertain_constrained_variance, -1.0);
         n.param<bool>("Reset/level_from_gravity", level_from_gravity_, true);
         n.param<double>("Reset/level_window_sec", level_window_sec_, 1.0);
         n.param<double>("Reset/datum_max_age_sec", datum_max_age_s_, 120.0);
@@ -1460,6 +1517,12 @@ public:
         // 0 keeps every scan, which is what offline reprocessing wants.
         // A real-time deployment should set this; see pcl_handler().
         n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
+        // Voxel map decay, see map_decay_policy.hpp. decay_sec <= 0 disables
+        // eviction; min_obs <= 1 matches against every voxel, which is the
+        // behaviour that predates this.
+        n.param<double>("Odometry/map_decay_sec", map_decay.decay_sec, 600.0);
+        n.param<int>("Odometry/map_min_obs", map_decay.min_obs, 1);
+        n.param<int>("Odometry/map_decay_interval", map_decay_interval_, 10);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
         n.param<double>("Initialization/motion_init_min_eigen_value",
@@ -1861,7 +1924,12 @@ public:
         msg.point_cloud_size = point_cloud_size;
         msg.match_count = last_match_count_;
         msg.normal_eigenvalue_min = last_normal_eigenvalue_min_;
+        msg.normal_eigenvalue_max = last_normal_eigenvalue_max_;
         msg.normal_observability = last_normal_observability_;
+        msg.degeneracy_direction_valid = last_degeneracy_valid_;
+        for (int i = 0; i < 3; i++)
+            msg.degenerate_direction[i] =
+                    static_cast<float>(last_degenerate_dir_[i]);
 
         msg.wheel_odom_violation_count = wheel_odom_violation_count_;
         msg.wheel_odom_diff = last_wheel_odom_diff_;
@@ -2069,7 +2137,25 @@ public:
 
         last_match_count_ = match_num;
         last_normal_eigenvalue_min_ = static_cast<float>(evalue[0]);
+        last_normal_eigenvalue_max_ = static_cast<float>(evalue[2]);
         last_normal_observability_ = (evalue[2] > 1e-9) ? static_cast<float>(evalue[0] / evalue[2]) : 0.0f;
+
+        // SelfAdjointEigenSolver computes the eigenvectors as well by default,
+        // so this direction has already been paid for; it used to be discarded
+        // and only the two scalars above kept.
+        //
+        // Eigenvalues come out ascending, so column 0 is the direction with the
+        // least plane-normal support - the one this scan does not constrain.
+        // The normals are map-frame, so it needs no rotating to line up with
+        // the odometry message's frame.
+        last_degenerate_dir_ = saes.eigenvectors().col(0);
+        last_degeneracy_valid_ = (match_num > 0 && evalue[2] > 1e-9);
+        g_degenerate_dir = last_degenerate_dir_;
+        g_degenerate_dir_valid = last_degeneracy_valid_;
+        g_degenerate_observability =
+                last_degeneracy_valid_
+                        ? static_cast<double>(last_normal_observability_)
+                        : 1.0;
 
         // Wheel-velocity IEKF update: anchors the LIO body-X velocity to the
         // wheel odom after the lidar IEKF has converged. This backstops the
@@ -2542,7 +2628,7 @@ public:
             PVec pvec_tem = *(bl->pvec);
             for (pointVar& pv : pvec_tem)
                 pv.pnt = xx.R * pv.pnt + xx.p;
-            cut_voxel(surf_map, pvec_tem, win_size, 0);
+            cut_voxel(surf_map, pvec_tem, win_size, 0, xx.t, false);
         }
 
         PLV(3)
@@ -2553,7 +2639,7 @@ public:
             for (pointVar& pv : *pvec_buf[i])
                 pwld.push_back(x_buf[i].R * pv.pnt + x_buf[i].p);
             cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld,
-                      sws[0]);
+                      sws[0], x_buf[i].t);
         }
 
         for (auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
@@ -2602,7 +2688,7 @@ public:
                     pvec.push_back(pv);
                 }
 
-                cut_voxel(surf_map, pvec, win_size, jour);
+                cut_voxel(surf_map, pvec, win_size, jour, -1.0, true);
                 kf.exist = 0;
                 history_kfsize--;
                 break;
@@ -3020,6 +3106,60 @@ public:
             iter->second->tras_opt(voxopt);
     }
 
+    // Evict voxels of surf_map that no scan has reached for
+    // map_decay.decay_sec of scan time. Returns the number evicted.
+    //
+    // The nodes are queued onto octos_release rather than deleted here: the
+    // recursive OctoTree delete is the expensive half, and
+    // release_pending_octos() already drains that queue under a time budget on
+    // the idle branch. The sweep itself is a pointer walk over the root map.
+    //
+    // Runs on the odometry thread, the only writer of surf_map.
+    int decay_surf_map(double now)
+    {
+        if (map_decay.decay_sec <= 0.0 || now <= 0.0)
+            return 0;
+
+        int evicted = 0;
+        for (auto iter = surf_map.begin(); iter != surf_map.end();)
+        {
+            OctoTree* oc = iter->second;
+            if (!shouldEvictVoxel(now, oc->last_seen_t, oc->decay_exempt, map_decay))
+            {
+                iter++;
+                continue;
+            }
+
+            // A voxel the sliding window still holds must not be freed
+            // underneath the local BA. multi_margi() drops voxels from
+            // surf_map_slide as soon as they stop being observed, so this
+            // only ever spares a voxel that is about to be observed again,
+            // but the cost of checking is one hash lookup.
+            if (surf_map_slide.find(iter->first) != surf_map_slide.end())
+            {
+                iter++;
+                continue;
+            }
+
+            oc->clear_slwd(sws[0]);
+            oc->tras_ptr(octos_release);
+            octos_release.push_back(oc);
+            surf_map.erase(iter++);
+            evicted++;
+        }
+
+        if (evicted > 0)
+        {
+            map_voxels_evicted_ += evicted;
+            ROS_INFO_THROTTLE(30.0,
+                              "voxel map decay: evicted %d voxels (%ld total), "
+                              "%zu remaining, %zu queued for release",
+                              evicted, map_voxels_evicted_, surf_map.size(),
+                              octos_release.size());
+        }
+        return evicted;
+    }
+
     // Free octree nodes that a map teardown has retired. Removing a node from
     // surf_map only queues its children here, so the queue has to be drained
     // somewhere or the map is dropped without its memory being returned.
@@ -3156,26 +3296,12 @@ public:
                 else if (release_flag)
                 {
                     release_flag = false;
-                    vector<OctoTree*> octos;
-                    for (auto iter = surf_map.begin(); iter != surf_map.end();)
-                    {
-                        int dis = jour - iter->second->jour;
-                        if (dis < 700)
-                        // if(dis < 200)
-                        {
-                            iter++;
-                        }
-                        else
-                        {
-                            octos.push_back(iter->second);
-                            iter->second->tras_ptr(octos);
-                            surf_map.erase(iter++);
-                        }
-                    }
-                    int ocsize = octos.size();
-                    for (int i = 0; i < ocsize; i++)
-                        delete octos[i];
-                    octos.clear();
+                    // Eviction itself has moved to the main path
+                    // (decay_surf_map): a thread that keeps up with its input
+                    // never reaches this branch, and that is exactly when the
+                    // map grows fastest. What is still worth doing here is
+                    // handing the freed pages back, which needs the thread to
+                    // be idle.
                     malloc_trim(0);
                 }
                 else if (sws[0].size() > 10000)
@@ -3420,9 +3546,10 @@ public:
                 voxhess.win_size = win_size;
 
                 // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1,
-                // surf_map_slide, win_size, pwld, sws[0]);
+                // surf_map_slide, win_size, pwld, sws[0], x_buf[win_count-1].t);
                 cut_voxel_multi(surf_map, pvec_buf[win_count - 1], win_count - 1,
-                                surf_map_slide, win_size, pwld, sws);
+                                surf_map_slide, win_size, pwld, sws,
+                                x_buf[win_count - 1].t);
                 t2 = ros::Time::now().toSec();
 
                 multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
@@ -3508,6 +3635,16 @@ public:
 
                 multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
                 t6 = ros::Time::now().toSec();
+
+                // Age the persistent map down. Unlike the travelled-distance
+                // rule this replaces, this fires while the vehicle is parked -
+                // a stationary robot watching moving canopy used to grow the
+                // map without bound because the distance counter never moved.
+                if (map_decay_interval_ > 0 &&
+                    (win_base + win_count) % map_decay_interval_ == 0)
+                {
+                    decay_surf_map(x_curr.t);
+                }
 
                 if ((win_base + win_count) % 10 == 0)
                 {
@@ -4053,7 +4190,7 @@ public:
                             pv.var(j, j) = ap.normal[j];
                         pvec_tem.push_back(pv);
                     }
-                    cut_voxel(map_loop, pvec_tem, win_size, 0);
+                    cut_voxel(map_loop, pvec_tem, win_size, 0, sp.x0.t, false);
                 }
 
                 if (subsize > init_num)

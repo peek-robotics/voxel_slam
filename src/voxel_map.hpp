@@ -1,6 +1,7 @@
 #ifndef VOXEL_MAP2_HPP
 #define VOXEL_MAP2_HPP
 
+#include "map_decay_policy.hpp"
 #include "tools.hpp"
 #include "preintegration.hpp"
 #include <thread>
@@ -88,6 +89,12 @@ int max_points = 100;
 double voxel_size = 1.0;
 int min_ba_point = 20;
 vector<double> plane_eigen_value_thre;
+
+// Voxel map decay / confirmation thresholds (map_decay_policy.hpp). File
+// scope for the same reason as the motion_init overrides below: OctoTree has
+// no back-pointer to VOXEL_SLAM, and match() is reached from free functions.
+// Populated once from YAML in the VOXEL_SLAM constructor.
+MapDecayPolicy map_decay;
 
 // motion_init() in voxelslam.cpp temporarily overrides min_eigen_value and
 // plane_eigen_value_thre while building the initial voxel map. The override
@@ -956,6 +963,22 @@ public:
   double jour = 0;
   float quater_length;
 
+  // Map-decay bookkeeping, see map_decay_policy.hpp. `last_seen_t` is the
+  // time of the most recent scan that put a point in this node, and
+  // `obs_count` counts those scans - not those points, since one scan drops
+  // many points into the same node. Every node on the root-to-leaf path is
+  // stamped: the root drives eviction (the map is keyed by root voxel), the
+  // leaf drives the match gate (a leaf is much smaller than its root, so the
+  // root's count is far too generous a proxy for it).
+  // `decay_exempt` marks a node holding prior-map content - a loaded session
+  // or a loop-closure map rebuild. Those carry no live observation time and
+  // are the map we mean to keep, so they neither age out nor wait to be
+  // confirmed. A live voxel that later receives prior-map points becomes
+  // exempt too, which is the conservative direction.
+  double last_seen_t = -1.0;
+  uint32_t obs_count = 0;
+  bool decay_exempt = false;
+
   Plane plane;
   bool isexist = false;
 
@@ -971,6 +994,17 @@ public:
     cov_add.setZero();
 
     // ins = 255.0*rand()/(RAND_MAX + 1.0f);
+  }
+
+  // Record that the scan at time `t` reached this node. Guarded on the
+  // timestamp changing so the many points one scan contributes count once.
+  inline void observe(double t)
+  {
+    if(last_seen_t != t)
+    {
+      last_seen_t = t;
+      if(obs_count != UINT32_MAX) obs_count++;
+    }
   }
 
   inline void push(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
@@ -1025,8 +1059,9 @@ public:
     return (eig_values[0] < min_eigen_value && (eig_values[0]/eig_values[2])<plane_eigen_value_thre[layer]);
   }
 
-  void allocate(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
+  void allocate(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws, double t)
   {
+    observe(t);
     if(octo_state == 0)
     {
       push(ord, pv, pw, sws);
@@ -1047,13 +1082,25 @@ public:
         leaves[leafnum]->quater_length = quater_length / 2;
       }
 
-      leaves[leafnum]->allocate(ord, pv, pw, sws);
+      leaves[leafnum]->allocate(ord, pv, pw, sws, t);
     }
 
   }
 
-  void allocate_fix(pointVar &pv)
+  // `t` is the time of the scan these points came from; `exempt` marks them
+  // as prior-map content that must not age out.
+  //
+  // Only a loaded session is exempt. A loop-closure map rebuild goes through
+  // here too, but those are live scans being re-expressed against a corrected
+  // trajectory - exempting them would make the whole map immortal on the
+  // first loop closure and quietly undo the decay entirely. They get stamped
+  // with their own scan time instead, which preserves their relative ages.
+  void allocate_fix(pointVar &pv, double t, bool exempt)
   {
+    if(exempt)
+      decay_exempt = true;
+    else
+      observe(t);
     if(octo_state == 0)
     {
       push_fix_novar(pv);
@@ -1074,7 +1121,7 @@ public:
         leaves[leafnum]->quater_length = quater_length / 2;
       }
 
-      leaves[leafnum]->allocate_fix(pv);
+      leaves[leafnum]->allocate_fix(pv, t, exempt);
     }
   }
 
@@ -1344,7 +1391,7 @@ public:
     int flag = 0;
     if(octo_state == 0)
     {
-      if(plane.is_plane)
+      if(plane.is_plane && voxelMatchable(obs_count, decay_exempt, map_decay))
       {
         float dis_to_plane = fabs(plane.normal.dot(wld - plane.center));
         float dis_to_center = (plane.center - wld).squaredNorm();
@@ -1508,7 +1555,9 @@ public:
 
 };
 
-void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<SlideWindow*> &sws)
+// `t` is the scan time stamped onto every voxel this scan reaches, for
+// map_decay_policy.hpp. Pass the time of the scan `pvec` came from.
+void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<SlideWindow*> &sws, double t)
 {
   int plsize = pvec->size();
   for(int i=0; i<plsize; i++)
@@ -1526,7 +1575,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     auto iter = feat_map.find(position);
     if(iter != feat_map.end())
     {
-      iter->second->allocate(win_count, pv, pw, sws);
+      iter->second->allocate(win_count, pv, pw, sws, t);
       iter->second->isexist = true;
       if(feat_tem_map.find(position) == feat_map.end())
         feat_tem_map[position] = iter->second;
@@ -1534,7 +1583,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     else
     {
       OctoTree* ot = new OctoTree(0, wdsize);
-      ot->allocate(win_count, pv, pw, sws);
+      ot->allocate(win_count, pv, pw, sws, t);
       ot->voxel_center[0] = (0.5+position.x) * voxel_size;
       ot->voxel_center[1] = (0.5+position.y) * voxel_size;
       ot->voxel_center[2] = (0.5+position.z) * voxel_size;
@@ -1547,7 +1596,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
 }
 
 // Cut the current scan into corresponding voxel in multi thread
-void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<vector<SlideWindow*>> &sws)
+void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<vector<SlideWindow*>> &sws, double t)
 {
   unordered_map<OctoTree*, vector<int>> map_pvec;
   int plsize = pvec->size();
@@ -1621,7 +1670,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
         for(int j=head; j<tail; j++)
         {
           for(int k: octs[j]->second)
-            octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sw);
+            octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sw, t);
         }
       }, part*i, part*(i+1), ref(sws[i])
     );
@@ -1633,7 +1682,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
     {
       for(int j=0; j<int(part); j++)
         for(int k: octs[j]->second)
-          octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sws[0]);
+          octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sws[0], t);
     }
     else
     {
@@ -1645,7 +1694,8 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
 
 }
 
-void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVec &pvec, int wdsize, double jour)
+// See OctoTree::allocate_fix() for `t` and `exempt`.
+void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVec &pvec, int wdsize, double jour, double t, bool exempt)
 {
   for(pointVar &pv: pvec)
   {
@@ -1660,11 +1710,15 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVec &pvec, int wd
     auto iter = feat_map.find(position);
     if(iter != feat_map.end())
     {
-      iter->second->allocate_fix(pv);
+      iter->second->allocate_fix(pv, t, exempt);
     }
     else
     {
       OctoTree* ot = new OctoTree(0, wdsize);
+      if(exempt)
+        ot->decay_exempt = true;
+      else
+        ot->observe(t);
       ot->push_fix_novar(pv);
       ot->voxel_center[0] = (0.5+position.x) * voxel_size;
       ot->voxel_center[1] = (0.5+position.y) * voxel_size;
