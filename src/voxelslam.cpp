@@ -1108,6 +1108,12 @@ public:
     ResetAttemptPolicy reset_attempt_policy_;
     int init_escalations_ = 0;
     double last_full_reset_time_ = -1.0;
+
+    // Stamp steps already acted on (see stamp_guard.hpp), and how many.
+    uint64_t stamp_epoch_handled_ = 0;
+    uint32_t stamp_discontinuities_ = 0;
+    // Set by a stamp step: frames initialization() holds are on the old clock.
+    bool clear_init_window_ = false;
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
@@ -1389,6 +1395,25 @@ public:
         n.param<double>("General/acc_scale", acc_scale_, 1.0);
         std::cout << "Lidar type: " << feat.lidar_type << std::endl;
         std::cout << "Topic: " << lid_topic << std::endl;
+
+        // Before subscribing: the guard sees every message.
+        StampGuardConfig stamp_cfg;
+        n.param<double>("Timing/imu_max_gap_sec", stamp_cfg.imu_max_gap_s, 0.5);
+        n.param<double>("Timing/imu_max_backstep_sec", stamp_cfg.imu_max_backstep_s, 0.05);
+        n.param<double>("Timing/cloud_max_gap_sec", stamp_cfg.cloud_max_gap_s, 0.0);
+        n.param<double>("Timing/max_cross_stream_offset_sec",
+                        stamp_cfg.max_cross_stream_offset_s, 1.0);
+        n.param<double>("Timing/max_host_offset_sec", stamp_cfg.max_host_offset_s, 0.0);
+        n.param<double>("Timing/settle_sec", stamp_cfg.settle_s, 1.0);
+        {
+            lock_guard<mutex> lock(mBuf);
+            stamp_guard = StampGuard(stamp_cfg);
+        }
+        ROS_INFO("Stamp guard: imu gap %.3f s, imu backstep %.3f s, cloud gap %.3f s, "
+                 "cross-stream %.3f s, host %.3f s, settle %.3f s (0 disables)",
+                 stamp_cfg.imu_max_gap_s, stamp_cfg.imu_max_backstep_s,
+                 stamp_cfg.cloud_max_gap_s, stamp_cfg.max_cross_stream_offset_s,
+                 stamp_cfg.max_host_offset_s, stamp_cfg.settle_s);
 
         sub_imu = n.subscribe(imu_topic, 80000, imu_handler);
         if (feat.lidar_type == LIVOX)
@@ -1817,6 +1842,42 @@ public:
             wheel_odom_violation_count_ = 0;
             wheel_lateral_violation_count_ = 0;
         }
+    }
+
+    // The input stamps stepped (see stamp_guard.hpp) and have since settled on
+    // a new time base; `imus` is the first batch on it. The state is still the
+    // one from before the step - nothing across it was integrated - but the
+    // window links frames by stamp and cannot span the step, so this is a full
+    // reset, run once per episode however often the clock stepped while it
+    // settled. It is done here rather than when the step is seen because a
+    // reset needs a batch of IMU to initialise from.
+    void resetAfterStampStep(deque<sensor_msgs::Imu::Ptr>& imus, Eigen::Vector3d& last_pos,
+                             double& jour, bool& motion_init_flag)
+    {
+        stamp_discontinuities_++;
+        string step;
+        {
+            lock_guard<mutex> lock(mBuf);
+            step = stamp_step_reason;
+        }
+        forceReset("Timestamp discontinuity: " + step + "; reset on the new time base",
+                   imus, last_pos, jour, motion_init_flag, true);
+
+        // Time state the reset does not own. forceReset has already taken
+        // last_full_reset_time_ from this batch, so escalation is measured on
+        // the new base.
+        odom_ekf.last_pcl_end_time = odom_ekf.pcl_end_time;
+        last_pcl_time = -1;
+        clear_init_window_ = true;
+        // The levelling window and any unspent gravity datum are keyed by the
+        // old clock. The reset above has used them against the pre-step state,
+        // which is what they were measured on; afterwards they would be
+        // compared against stamps on the new base.
+        imu_level_time_.clear();
+        imu_level_acc_.clear();
+        imu_level_gyr_.clear();
+        datum_correction_ = Eigen::Matrix3d::Identity();
+        datum_stamp_ = -1.0;
     }
 
     void pub_diagnostics(double stamp,
@@ -2618,6 +2679,14 @@ public:
         static vector<double> beg_times;
         static vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
 
+        if (clear_init_window_)
+        {
+            pl_origs.clear();
+            beg_times.clear();
+            vec_imus.clear();
+            clear_init_window_ = false;
+        }
+
         pcl::PointCloud<PointType>::Ptr orig(
                 new pcl::PointCloud<PointType>(*pcl_curr));
         if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
@@ -3189,6 +3258,18 @@ public:
                 }
 
                 sleep(0.001);
+                continue;
+            }
+
+            // The first batch after a stamp step: reset onto the new time base
+            // before anything integrates across it. pl_epoch is the epoch this
+            // batch was checked against, not the current one, so a step
+            // arriving after it was taken is handled on the next batch.
+            if (pl_epoch != stamp_epoch_handled_)
+            {
+                stamp_epoch_handled_ = pl_epoch;
+                resetAfterStampStep(imus, last_pos, jour, motion_init_flag);
+                degrade_cnt = 0;
                 continue;
             }
 
