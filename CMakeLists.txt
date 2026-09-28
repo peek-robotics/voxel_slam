@@ -131,4 +131,10 @@ if(CATKIN_ENABLE_TESTING)
     ${PCL_INCLUDE_DIRS}
   )
   target_link_libraries(test_gravity_align gtest_main ${PCL_LIBRARIES})
+
+  catkin_add_gtest(test_map_decay_policy test/test_map_decay_policy.cpp)
+  target_include_directories(test_map_decay_policy BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(test_map_decay_policy gtest_main)
 endif()
