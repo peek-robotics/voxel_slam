@@ -9,7 +9,7 @@ namespace voxel_slam {
 class VoxelSlamNodelet final : public nodelet::Nodelet {
 public:
 	VoxelSlamNodelet() = default;
-	~VoxelSlamNodelet() override = default;
+	~VoxelSlamNodelet() override;
 
 private:
 	void onInit() override;

@@ -57,6 +57,20 @@ deque<double> time_buf;
 int max_pcl_buf = 0;
 long pcl_dropped = 0;
 
+// Trailing extent of the global voxel map, in metres of travelled path. A
+// voxel is dropped once the path length (jour) has advanced this far past
+// where the voxel was last touched. Larger keeps more map behind the robot
+// (more memory); smaller trims sooner. The eviction only runs on the idle
+// branch, so this bounds the retained trail, not the peak. See
+// thd_odometry_localmapping().
+int map_retain_dist = 700;
+
+// Cap on the recycled SlideWindow pool. A map teardown hands its windows back
+// to this pool, each still holding the point capacity it last grew to; without
+// a cap they accumulate. Enforced on the idle branch and inline via
+// trim_slwd_pool().
+int slwd_pool_cap = 10000;
+
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
