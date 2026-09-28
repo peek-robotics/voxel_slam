@@ -339,29 +339,6 @@ void read_lidarstate(string filename, vector<ScanPose *> &bl_tem) {
   }
 }
 
-double get_memory() {
-  ifstream infile("/proc/self/status");
-  double mem = -1;
-  string lineStr, str;
-  while (getline(infile, lineStr)) {
-    stringstream ss(lineStr);
-    bool is_find = false;
-    while (ss >> str) {
-      if (str == "VmRSS:") {
-        is_find = true;
-        continue;
-      }
-
-      if (is_find)
-        mem = stod(str);
-      break;
-    }
-    if (is_find)
-      break;
-  }
-  return mem / (1048576);
-}
-
 void icp_check(pcl::PointCloud<PointType> &pl_src,
                pcl::PointCloud<PointType> &pl_tar, ros::Publisher &pub_src,
                ros::Publisher &pub_tar,
