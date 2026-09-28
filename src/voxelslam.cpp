@@ -1112,6 +1112,11 @@ public:
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
+    double max_imu_gap_s_ = 0.5;
+    double imu_gap_resume_time_ = -1.0; // >= 0 while waiting to reset after a gap
+    bool keep_last_z_ = true;           // reset keeps the last estimated z over the TF's
+    bool have_last_good_z_ = false;
+    double last_good_z_ = 0.0;
 
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
@@ -1456,11 +1461,18 @@ public:
                         reset_attempt_policy_.escalate_growth, 2.0);
         n.param<double>("Reset/max_escalate_sec",
                         reset_attempt_policy_.max_escalate_s, 60.0);
+        n.param<double>("Reset/max_imu_gap_sec", max_imu_gap_s_, 0.5);
+        n.param<bool>("Reset/keep_last_z", keep_last_z_, true);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         // 0 keeps every scan, which is what offline reprocessing wants.
         // A real-time deployment should set this; see pcl_handler().
         n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
+        // Global-map trailing extent (m of path) and SlideWindow pool cap.
+        // Defaults reproduce the values these were hardcoded to; see
+        // thd_odometry_localmapping().
+        n.param<int>("Odometry/map_retain_dist", map_retain_dist, 700);
+        n.param<int>("Odometry/slwd_pool_cap", slwd_pool_cap, 10000);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
         n.param<double>("Initialization/motion_init_min_eigen_value",
@@ -2803,13 +2815,18 @@ public:
             if (syncStatePositionAndYawToExternal(x_curr, preserved_roll_pitch,
                                                   0.5, &tf_error))
             {
+                // The 2D EKF's TF z is just the mount height; keep ours.
+                const bool keep_z = keep_last_z_ && have_last_good_z_;
+                if (keep_z)
+                    x_curr.p.z() = last_good_z_;
                 initialized_from_tf = true;
                 g_has_anchor = true;
                 g_pose_source = PoseSource::External;
                 markPoseDiscontinuity();
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
-                                               << " using x/y/z/yaw: p=["
-                                               << x_curr.p.transpose() << "]");
+                                               << " using x/y/yaw, z from "
+                                               << (keep_z ? "last estimate" : "TF")
+                                               << ": p=[" << x_curr.p.transpose() << "]");
             }
             else
             {
@@ -3159,8 +3176,7 @@ public:
                     for (auto iter = surf_map.begin(); iter != surf_map.end();)
                     {
                         int dis = jour - iter->second->jour;
-                        if (dis < 700)
-                        // if(dis < 200)
+                        if (dis < map_retain_dist)
                         {
                             iter++;
                         }
@@ -3177,7 +3193,7 @@ public:
                     octos.clear();
                     malloc_trim(0);
                 }
-                else if (sws[0].size() > 10000)
+                else if (sws[0].size() > static_cast<size_t>(slwd_pool_cap))
                 {
                     for (int i = 0; i < 500; i++)
                     {
@@ -3198,10 +3214,42 @@ public:
             // memory comes back. malloc_trim() stays on the idle path: walking
             // the arenas is the expensive half, returning the nodes is not.
             release_pending_octos(5.0);
-            trim_slwd_pool(10000, 5.0);
+            trim_slwd_pool(slwd_pool_cap, 5.0);
 
             updateLevelWindow(imus);
             updateGravityDatum();
+
+            // A LiDAR dropout stops the Mid-360's IMU too, and propagating across
+            // the gap extrapolates one stale sample over all of it. Reset
+            // instead, once level_window_sec of fresh IMU lets the reset level
+            // from it. Tracking only; init failures handle their own gaps.
+            if (!motion_init_flag && max_imu_gap_s_ > 0.0 && odom_ekf.last_imu)
+            {
+                if (imu_gap_resume_time_ < 0.0)
+                {
+                    double prev = odom_ekf.last_imu->header.stamp.toSec();
+                    for (const sensor_msgs::Imu::Ptr& m : imus)
+                    {
+                        const double t = m->header.stamp.toSec();
+                        if (t - prev > max_imu_gap_s_)
+                        {
+                            ROS_WARN("IMU gap of %.1f s; resetting after %.1f s of fresh IMU",
+                                     t - prev, level_window_sec_);
+                            imu_gap_resume_time_ = t;
+                        }
+                        prev = t;
+                    }
+                }
+                if (imu_gap_resume_time_ >= 0.0)
+                {
+                    if (odom_ekf.pcl_end_time - imu_gap_resume_time_ < level_window_sec_)
+                        continue;
+                    imu_gap_resume_time_ = -1.0;
+                    forceReset("IMU gap", imus, last_pos, jour, motion_init_flag, false);
+                    degrade_cnt = 0;
+                    continue;
+                }
+            }
 
             static int first_flag = 1;
             if (first_flag)
@@ -3322,11 +3370,16 @@ public:
                 }
 
                 const uint8_t active_state_pre = std::min<uint8_t>(static_cast<uint8_t>(active_degrade_state_pre), static_cast<uint8_t>(DegradeState::High));
-                const int down_size_div = static_cast<int>(active_state_pre);
-                const double effective_down_size = base_down_size_ / static_cast<double>(down_size_div);
-                const double err_scale = std::sqrt(static_cast<double>(active_state_pre));
-                const double effective_dept_err = base_dept_err_; // * err_scale;
-                const double effective_beam_err = base_beam_err_; // * err_scale;
+                // Degrade state no longer scales the downsample resolution. Making
+                // the cloud finer in low-observability zones (orchard foliage)
+                // exploded the point count -> recut/BA/map cost blew the frame
+                // budget and the fine, non-planar points never restored
+                // observability, so the state latched at High. Downsample always
+                // at the configured base size; the IMU trust below still stiffens
+                // with degradation, which is the useful part of the response.
+                const double effective_down_size = base_down_size_;
+                const double effective_dept_err = base_dept_err_;
+                const double effective_beam_err = base_beam_err_;
                 imu_coef = base_imu_coef_ * static_cast<double>(active_state_pre);
 
                 {
@@ -3349,6 +3402,11 @@ public:
 
                 // Run state estimation
                 estimation_success = GPROF_CALL("lio", lio_state_estimation(pptr));
+                if (estimation_success)
+                {
+                    have_last_good_z_ = true;
+                    last_good_z_ = x_curr.p.z();
+                }
 
                 // Motion Stability Check (Phase 1 Degeneration Improvement)
                 // Compute rotation magnitude from last frame to detect rapid rotations
