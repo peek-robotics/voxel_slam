@@ -10,8 +10,36 @@
 - Ability to start and recover from current odom
 - Added alternate odom source input as a sanity check reset (avoid runaways in corridors)
 - Merged [LTU-RAI's mods](https://github.com/LTU-RAI/Voxel-SLAM).
+- Per-section timing through the shared `grover_profiling` harness (`GPROF_*`),
+  with an opt-in periodic report (see below).
 
 ### Added features are purely for our use cases and are not guaranteed to work with all existing features
+
+## Profiling
+
+Section timings are recorded with the header-only `grover_profiling` harness
+(`GPROF_SCOPE` / `GPROF_CALL` / `GPROF_GAUGE`). The measurement is always
+compiled in and off unless `Profiling/enable` is set; when enabled a reporter
+thread emits a tagged, colour-coded block every `1/report_hz` seconds —
+sections slowest-first with avg/max ms and counts, plus process RSS/VM, the
+voxel map size and the input-queue depth (the same block the backend prints):
+
+```
+[prof] rss 379.9 MB | vm 1724.9 MB | peak 379.9 MB | voxel_map_size 12075.0
+       local_ba            8.8 /   27.0 ms  n=287
+       recut               8.9 /   19.3 ms  n=287
+       ...
+```
+
+```
+Profiling:
+  enable: true       # emit the periodic report
+  report_hz: 0.2     # every 5 s
+```
+
+The old per-frame `t0..t6` scratch timers and the commented-out timing `printf`
+are gone; `LIODiag.processing_time_ms` is unchanged (now measured on a
+monotonic clock).
 
 ## 1. Introduction
 

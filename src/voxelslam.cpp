@@ -14,9 +14,12 @@
 #include <pcl/common/transforms.h>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tf/transform_listener.h>
 
 #include <voxel_slam/LIODiag.h>
+
+#include <grover_profiling/profiling.hpp>
 
 using namespace std;
 
@@ -850,6 +853,7 @@ public:
                     vector<vector<SlideWindow*>>& sws, IMUST& x_curr,
                     deque<IMU_PRE*>& imu_pre_buf, IMUST& extrin_para, double acc_scale)
     {
+        GPROF_SCOPE("motion_init");
         PLV(3)
         pwld;
         double last_g_norm = x_buf[0].g.norm();
@@ -867,7 +871,6 @@ public:
         for (double& iter : plane_eigen_value_thre)
             iter = motion_init_plane_eigen_ratio_;
 
-        double t0 = ros::Time::now().toSec();
         double converge_thre = 0.05;
         int converge_times = 0;
         bool is_degrade = true;
@@ -1033,8 +1036,6 @@ public:
         pl_origs.clear();
         vec_imus.clear();
         beg_times.clear();
-        double t1 = ros::Time::now().toSec();
-        ROS_DEBUG("motion_init took %.3f s", t1 - t0);
 
         // align_gravity(x_buf);
         pcl::PointCloud<PointType> pcl_send;
@@ -2712,26 +2713,27 @@ public:
                 break;
         }
 
-        double tt1 = ros::Time::now().toSec();
-        for (pointVar pv : *pptr)
         {
-            pv.pnt = x_curr.R * pv.pnt + x_curr.p;
-            PointType ap;
-            ap.x = pv.pnt[0];
-            ap.y = pv.pnt[1];
-            ap.z = pv.pnt[2];
-            pl_tree->push_back(ap);
+            GPROF_SCOPE("lio_kdmap");
+            for (pointVar pv : *pptr)
+            {
+                pv.pnt = x_curr.R * pv.pnt + x_curr.p;
+                PointType ap;
+                ap.x = pv.pnt[0];
+                ap.y = pv.pnt[1];
+                ap.z = pv.pnt[2];
+                pl_tree->push_back(ap);
+            }
+            down_sampling_voxel(*pl_tree, 0.5);
+            kd_map.setInputCloud(pl_tree);
         }
-        down_sampling_voxel(*pl_tree, 0.5);
-        kd_map.setInputCloud(pl_tree);
-        double tt2 = ros::Time::now().toSec();
     }
 
     // After detecting loop closure, refine current map and states
     void loop_update()
     {
         printf("loop update: %zu\n", sws[0].size());
-        double t1 = ros::Time::now().toSec();
+        GPROF_SCOPE("loop_update");
         for (auto iter = surf_map.begin(); iter != surf_map.end(); iter++)
         {
             // octos_release.push_back(iter->second);
@@ -2821,8 +2823,6 @@ public:
         if (g_update == 1)
             g_update = 2;
         loop_detect = 0;
-        double t2 = ros::Time::now().toSec();
-        printf("loop head: %lf %zu\n", t2 - t1, sws[0].size());
     }
 
     // load the previous keyframe in the local voxel map
@@ -2830,7 +2830,6 @@ public:
     {
         if (history_kfsize <= 0)
             return;
-        double tt1 = ros::Time::now().toSec();
         PointType ap_curr;
         ap_curr.x = x_curr.p[0];
         ap_curr.y = x_curr.p[1];
@@ -3551,8 +3550,17 @@ public:
                 first_flag = 0;
             }
 
-            double t0 = ros::Time::now().toSec();
-            double t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0;
+            // Wall time of one odometry iteration, for LIODiag.processing_time_ms.
+            // The per-section breakdown is recorded through the grover_profiling
+            // harness (GPROF_* below); this clock only feeds the pre-existing
+            // diagnostics field. steady_clock, not ros::Time: a latency number
+            // must not move when sim time or the system clock jumps.
+            const auto frame_start = std::chrono::steady_clock::now();
+            const auto frame_ms = [&frame_start]() {
+                return std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - frame_start)
+                        .count();
+            };
 
             bool estimation_success = false;
             double rotation_angle_deg = 0.0;
@@ -3621,7 +3629,6 @@ public:
                         }
                     }
 
-                    double t_end = ros::Time::now().toSec();
                     pub_diagnostics(odom_ekf.pcl_end_time,
                                     estimation_success,
                                     degrade_cnt,
@@ -3629,13 +3636,13 @@ public:
                                     motion_stable,
                                     diag_cloud_size,
                                     slam_vx_body,
-                                    (t_end - t0) * 1000.0);
+                                    frame_ms());
                     continue;
                 }
             }
             else
             {
-                if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
+                if (GPROF_CALL("ekf", odom_ekf.process(x_curr, *pcl_curr, imus)) == 0)
                     continue;
 
                 // Publish full-resolution deskewed LiDAR-frame scan (before any downsampling).
@@ -3643,6 +3650,7 @@ public:
                 // can subscribe to this instead of the downsampled map_scan.
                 if (pub_scan_full.getNumSubscribers() > 0)
                 {
+                    GPROF_SCOPE("pub_scan_full");
                     sensor_msgs::PointCloud2 full_msg;
                     pcl::toROSMsg(*pcl_curr, full_msg);
                     full_msg.header.frame_id = base_link;  // LiDAR frame
@@ -3673,21 +3681,26 @@ public:
                 const double effective_beam_err = base_beam_err_; // * err_scale;
                 imu_coef = base_imu_coef_ * static_cast<double>(active_state_pre);
 
-                down_sampling_voxel(pl_down, effective_down_size);
-
-                if (pl_down.size() < 500)
                 {
-                    pl_down = *pcl_curr;
-                    down_sampling_voxel(pl_down, effective_down_size / 2.0);
+                    GPROF_SCOPE("downsample");
+                    down_sampling_voxel(pl_down, effective_down_size);
+
+                    if (pl_down.size() < 500)
+                    {
+                        pl_down = *pcl_curr;
+                        down_sampling_voxel(pl_down, effective_down_size / 2.0);
+                    }
                 }
 
                 diag_cloud_size = static_cast<int>(pl_down.size());
 
                 PVecPtr pptr(new PVec);
-                var_init(extrin_para, pl_down, pptr, effective_dept_err, effective_beam_err);
+                GPROF_CALL("var_init",
+                           var_init(extrin_para, pl_down, pptr, effective_dept_err,
+                                    effective_beam_err));
 
                 // Run state estimation
-                estimation_success = lio_state_estimation(pptr);
+                estimation_success = GPROF_CALL("lio", lio_state_estimation(pptr));
 
                 // Motion Stability Check (Phase 1 Degeneration Improvement)
                 // Compute rotation magnitude from last frame to detect rapid rotations
@@ -3726,14 +3739,18 @@ public:
                                       degrade_cnt, rotation_angle_deg);
                 }
 
-                pwld.clear();
-                pvec_update(pptr, x_curr, pwld);
-                ResultOutput::instance().pub_localtraj(
-                        pwld, jour, x_curr, sessionNames.size() - 1, pcl_path,
-                        pptr);
+                {
+                    GPROF_SCOPE("publish_odom");
+                    pwld.clear();
+                    pvec_update(pptr, x_curr, pwld);
+                    ResultOutput::instance().pub_localtraj(
+                            pwld, jour, x_curr, sessionNames.size() - 1, pcl_path,
+                            pptr);
+                }
 
                 if (wheel_odom_check_enabled_)
                 {
+                    GPROF_SCOPE("wheel_check");
                     const Eigen::Vector3d vel_body = x_curr.R.transpose() * x_curr.v;
                     slam_vx_body = vel_body.x();
                     string wheel_error;
@@ -3745,6 +3762,7 @@ public:
                 // Publish local accumulated cloud (current frame as reference)
                 if (pub_local_accumulated)
                 {
+                    GPROF_SCOPE("local_accumulated");
                     Eigen::Matrix4f T_lidar_to_map = Eigen::Matrix4f::Identity();
                     // map/odom <- imu <- lidar
                     Eigen::Matrix3f R_wl = (x_curr.R * extrin_para.R).cast<float>();
@@ -3754,8 +3772,6 @@ public:
                     AddScanToRollingBuffer(pcl_curr, T_lidar_to_map);
                     PublishLocalAccumulated(T_lidar_to_map, odom_ekf.pcl_end_time);
                 }
-
-                t1 = ros::Time::now().toSec();
 
                 win_count++;
                 x_buf.push_back(x_curr);
@@ -3767,19 +3783,19 @@ public:
                     imu_pre_buf[win_count - 2]->push_imu(imus);
                 }
 
-                keyframe_loading(jour);
+                GPROF_CALL("keyframe_loading", keyframe_loading(jour));
                 voxhess.clear();
                 voxhess.win_size = win_size;
 
                 // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1,
                 // surf_map_slide, win_size, pwld, sws[0], x_buf[win_count-1].t);
-                cut_voxel_multi(surf_map, pvec_buf[win_count - 1], win_count - 1,
-                                surf_map_slide, win_size, pwld, sws,
-                                x_buf[win_count - 1].t);
-                t2 = ros::Time::now().toSec();
+                GPROF_CALL("cut_voxel",
+                           cut_voxel_multi(surf_map, pvec_buf[win_count - 1],
+                                           win_count - 1, surf_map_slide, win_size,
+                                           pwld, sws, x_buf[win_count - 1].t));
 
-                multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
-                t3 = ros::Time::now().toSec();
+                GPROF_CALL("recut",
+                           multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws));
 
                 const int combined_degradation_post = degrade_cnt + wheel_odom_violation_count_ + wheel_lateral_violation_count_;
                 const DegradeState active_degrade_state_post = updateDegradeState(degrade_cnt);
@@ -3824,45 +3840,47 @@ public:
 
             if (win_count >= win_size)
             {
-                t4 = ros::Time::now().toSec();
-
-                if (g_update == 2)
                 {
-                    LI_BA_OptimizerGravity opt_lsv;
-                    vector<double> resis;
-                    opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
-                    printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1],
-                           x_buf[0].g[2], x_buf[0].g.norm());
-                    g_update = 0;
-                    x_curr.g = x_buf[win_count - 1].g;
+                    GPROF_SCOPE("local_ba");
+                    if (g_update == 2)
+                    {
+                        LI_BA_OptimizerGravity opt_lsv;
+                        vector<double> resis;
+                        opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
+                        printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1],
+                               x_buf[0].g[2], x_buf[0].g.norm());
+                        g_update = 0;
+                        x_curr.g = x_buf[win_count - 1].g;
+                    }
+                    else
+                    {
+                        LI_BA_Optimizer opt_lsv;
+                        opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
+                    }
+
+                    if (enable_loop_closure)
+                    {
+                        ScanPose* bl = new ScanPose(x_buf[0], pvec_buf[0]);
+                        bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+                        for (int i = 0; i < 6; i++)
+                            bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+                        mtx_loop.lock();
+                        buf_lba2loop.push_back(bl);
+                        mtx_loop.unlock();
+                    }
+
+                    x_curr.R = x_buf[win_count - 1].R;
+                    x_curr.p = x_buf[win_count - 1].p;
                 }
-                else
-                {
-                    LI_BA_Optimizer opt_lsv;
-                    opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
-                }
 
-                if (enable_loop_closure)
-                {
-                    ScanPose* bl = new ScanPose(x_buf[0], pvec_buf[0]);
-                    bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-                    for (int i = 0; i < 6; i++)
-                        bl->v6[i] = 1.0 / fabs(bl->v6[i]);
-                    mtx_loop.lock();
-                    buf_lba2loop.push_back(bl);
-                    mtx_loop.unlock();
-                }
+                GPROF_CALL("pub_localmap",
+                           ResultOutput::instance().pub_localmap(
+                                   mgsize, sessionNames.size() - 1, pvec_buf, x_buf,
+                                   pcl_path, win_base, win_count));
 
-                x_curr.R = x_buf[win_count - 1].R;
-                x_curr.p = x_buf[win_count - 1].p;
-                t5 = ros::Time::now().toSec();
-
-                ResultOutput::instance().pub_localmap(mgsize, sessionNames.size() - 1,
-                                                      pvec_buf, x_buf, pcl_path,
-                                                      win_base, win_count);
-
-                multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
-                t6 = ros::Time::now().toSec();
+                GPROF_CALL("marginalize",
+                           multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess,
+                                       sws[0]));
 
                 // Age the persistent map down. Unlike the travelled-distance
                 // rule this replaces, this fires while the vehicle is parked -
@@ -3920,14 +3938,12 @@ public:
                 win_count -= mgsize;
             }
 
-            double t_end = ros::Time::now().toSec();
-            double mem = get_memory();
-            // printf("%d: %.4lf: %.4lf %.4lf %.4lf %.4lf %.4lf %.2lfGb %.1lf\n",
-            // win_base+win_count, t_end-t0, t1-t0, t2-t1, t3-t2, t5-t4, t6-t5, mem,
-            // jour);
-
-            // printf("%d: %lf %lf %lf\n", win_base + win_count, x_curr.p[0],
-            // x_curr.p[1], x_curr.p[2]);
+            // Gauges read on the odometry thread, which owns surf_map/sws, and
+            // emitted by the reporter at report time. This also keeps the
+            // process-memory read off the per-frame path - the reporter
+            // refreshes it once per report, not once per scan.
+            GPROF_GAUGE("voxel_map_size", static_cast<double>(surf_map.size()));
+            GPROF_GAUGE("sws_pool", static_cast<double>(sws[0].size()));
 
             pub_diagnostics(odom_ekf.pcl_end_time,
                             estimation_success,
@@ -3936,7 +3952,7 @@ public:
                             motion_stable,
                             diag_cloud_size,
                             slam_vx_body,
-                            (t_end - t0) * 1000.0);
+                            frame_ms());
         }
 
         vector<OctoTree*> octos;
@@ -4526,9 +4542,11 @@ public:
         pub_pl_func(pl0, pub_prev_path);
         pub_pl_func(pl0, pub_scan);
 
-        double t0 = ros::Time::now().toSec();
-        while (gba_flag)
-            ;
+        {
+            GPROF_SCOPE("gba_wait");
+            while (gba_flag)
+                ;
+        }
 
         for (PGO_Edge& edge : gba_edges1.edges)
         {
@@ -4566,15 +4584,19 @@ public:
             }
         }
 
-        gtsam::ISAM2Params parameters;
-        parameters.relinearizeThreshold = 0.01;
-        parameters.relinearizeSkip = 1;
-        gtsam::ISAM2 isam(parameters);
-        isam.update(graph, initial);
+        gtsam::Values results;
+        {
+            GPROF_SCOPE("gba_isam");
+            gtsam::ISAM2Params parameters;
+            parameters.relinearizeThreshold = 0.01;
+            parameters.relinearizeSkip = 1;
+            gtsam::ISAM2 isam(parameters);
+            isam.update(graph, initial);
 
-        for (int i = 0; i < 5; i++)
-            isam.update();
-        gtsam::Values results = isam.calculateEstimate();
+            for (int i = 0; i < 5; i++)
+                isam.update();
+            results = isam.calculateEstimate();
+        }
         int resultsize = results.size();
 
         int idsize = ids.size();
@@ -4590,9 +4612,6 @@ public:
         }
 
         Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
-
-        double t1 = ros::Time::now().toSec();
-        printf("GBA opt: %lfs\n", t1 - t0);
 
         for (int ii = 0; ii < idsize; ii++)
         {
@@ -4621,7 +4640,7 @@ public:
         if (plptr == nullptr)
             is_display = true;
 
-        double t0 = ros::Time::now().toSec();
+        GPROF_SCOPE("gba_add_edge");
         vector<Keyframe*> smps;
         vector<IMUST> xs;
         int last_mp = -1, isCnct = 0;
@@ -4831,8 +4850,6 @@ public:
             }
             mtx_keyframe.unlock();
 
-            double tg1 = ros::Time::now().toSec();
-
             Keyframe* gba_smp = new Keyframe(smp_local[0]->x0);
             vector<int> mps{smp_mp};
             HBA_add_edge(xs, smp_local, gba_edges1, mps, 1, 2, gba_smp->plptr);
@@ -4879,6 +4896,39 @@ public:
             }
         }
     }
+
+    // Periodic profiling report. Measures nothing itself: the GPROF_* sites
+    // accumulate section timings (and the odometry thread publishes the map-size
+    // gauges), while this thread samples the gauges that no other thread owns,
+    // emits one line, and resets the window. Started only when
+    // Profiling/enable is set; the section timers can also be switched at
+    // runtime via grover_profile::set_enabled().
+    void thd_profiling_report(ros::NodeHandle& n)
+    {
+        double report_hz = 1.0;
+        n.param<double>("Profiling/report_hz", report_hz, 1.0);
+        if (report_hz <= 0.0)
+            report_hz = 1.0;
+        const std::chrono::duration<double> period(1.0 / report_hz);
+
+        while (n.ok())
+        {
+            std::this_thread::sleep_for(period);
+
+            double pcl_queue = 0.0;
+            double pcl_dropped_now = 0.0;
+            mBuf.lock();
+            pcl_queue = static_cast<double>(pcl_buf.size());
+            pcl_dropped_now = static_cast<double>(pcl_dropped);
+            mBuf.unlock();
+            GPROF_GAUGE("pcl_queue", pcl_queue);
+            GPROF_GAUGE("pcl_dropped", pcl_dropped_now);
+
+            // take_report_line() refreshes the process-memory gauges, consumes
+            // the section window, and formats the tagged, colour-coded block.
+            ROS_INFO("%s", grover_profile::take_report_line().c_str());
+        }
+    }
 };
 
 #ifndef VOXEL_SLAM_NO_MAIN
@@ -4900,17 +4950,26 @@ int main(int argc, char** argv)
     for (int i = 0; i < vs.win_size; i++)
         mp[i] = i;
 
-    std::unique_ptr<thread> thread_loop_ptr, thread_gba_ptr;
+    std::unique_ptr<thread> thread_loop_ptr, thread_gba_ptr, thread_prof_ptr;
     if (enable_loop_closure)
     {
         thread_loop_ptr.reset(new thread(&VOXEL_SLAM::thd_loop_closure, &vs, ref(n)));
         thread_gba_ptr.reset(new thread(&VOXEL_SLAM::thd_globalmapping, &vs, ref(n)));
     }
+
+    bool profiling_enable = false;
+    n.param<bool>("Profiling/enable", profiling_enable, false);
+    grover_profile::set_enabled(profiling_enable);
+    if (profiling_enable)
+        thread_prof_ptr.reset(new thread(&VOXEL_SLAM::thd_profiling_report, &vs, ref(n)));
+
     vs.thd_odometry_localmapping(n);
     if (thread_loop_ptr)
         thread_loop_ptr->join();
     if (thread_gba_ptr)
         thread_gba_ptr->join();
+    if (thread_prof_ptr)
+        thread_prof_ptr->join();
     ros::spin();
     return 0;
 }
@@ -4938,6 +4997,15 @@ extern "C" void voxel_slam_start(ros::NodeHandle& n)
         std::thread thread_gba(&VOXEL_SLAM::thd_globalmapping, vs, std::ref(n));
         thread_loop.detach();
         thread_gba.detach();
+    }
+
+    bool profiling_enable = false;
+    n.param<bool>("Profiling/enable", profiling_enable, false);
+    grover_profile::set_enabled(profiling_enable);
+    if (profiling_enable)
+    {
+        std::thread thread_prof(&VOXEL_SLAM::thd_profiling_report, vs, std::ref(n));
+        thread_prof.detach();
     }
 
     // Run odometry/local mapping in yet another detached thread
