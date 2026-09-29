@@ -4,6 +4,7 @@
 #include "ekf_imu.hpp"
 #include "feature_point.hpp"
 #include "loop_refine.hpp"
+#include "stamp_guard.hpp"
 #include "ros/publisher.h"
 #include "tools.hpp"
 #include "voxel_map.hpp"
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <nav_msgs/Odometry.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <sstream>
 #include <tf/transform_broadcaster.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -60,6 +62,54 @@ long pcl_dropped = 0;
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
+
+// Header stamp continuity across both streams; see stamp_guard.hpp. Guarded by
+// mBuf, as are the buffers it flushes.
+StampGuard stamp_guard;
+// A cloud popped by sync_packages() waiting for its IMU, and the stamp epoch
+// it was popped in. A step in between makes it unusable.
+bool pl_ready = false;
+uint64_t pl_epoch = 0;
+// What the most recent step was, for the reset reason.
+std::string stamp_step_reason;
+
+// Must be called with mBuf held. Returns whether the message may be buffered.
+// On a step everything buffered is on the old time base, so it is discarded;
+// the odometry thread sees the epoch change and resets.
+bool admit_stamp(StampStream stream, double t) {
+  // Only read the clock when it is compared against: under simulated time it
+  // takes a lock, and this runs for every IMU sample.
+  const double host_now =
+      stamp_guard.config().max_host_offset_s > 0.0 ? ros::Time::now().toSec() : 0.0;
+  const StampDecision d = stamp_guard.observe(stream, t, host_now);
+  if (d.verdict == StampVerdict::Accept)
+    return true;
+
+  if (d.verdict == StampVerdict::Step) {
+    const size_t dropped_imu = imu_buf.size();
+    const size_t dropped_pcl = pcl_buf.size();
+    imu_buf.clear();
+    pcl_buf.clear();
+    time_buf.clear();
+    imu_last_time = -1;
+    std::ostringstream reason;
+    reason << stampStreamName(stream) << " " << d.reason << " (dt=" << d.dt << " s)";
+    stamp_step_reason = reason.str();
+    ROS_ERROR("[voxel_slam] %s header stamp discontinuity: %s (dt=%.6f s, stamp=%.6f, "
+              "host=%.6f). Discarded %zu IMU and %zu buffered scans; holding input "
+              "until both streams settle, then resetting.",
+              stampStreamName(stream), d.reason.c_str(), d.dt, t, host_now,
+              dropped_imu, dropped_pcl);
+  } else if (!d.reason.empty()) {
+    ROS_WARN_THROTTLE(2.0, "[voxel_slam] holding input: %s %s (dt=%.6f s, stamp=%.6f, host=%.6f)",
+                      stampStreamName(stream), d.reason.c_str(), d.dt, t, host_now);
+  } else {
+    ROS_WARN_THROTTLE(2.0, "[voxel_slam] holding input until IMU and scan stamps have been "
+                           "continuous for %.1f s",
+                      stamp_guard.config().settle_s);
+  }
+  return false;
+}
 double acc_scale_ = 1.0;
 
 bool use_odom_init_tf = false; // if true, initialize from current TF(odom->base_link)
@@ -107,8 +157,10 @@ void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in) {
   //   msg->linear_acceleration.z = -9.7;
 
   mBuf.lock();
-  imu_last_time = msg->header.stamp.toSec();
-  imu_buf.push_back(msg);
+  if (admit_stamp(StampStream::Imu, msg->header.stamp.toSec())) {
+    imu_last_time = msg->header.stamp.toSec();
+    imu_buf.push_back(msg);
+  }
   mBuf.unlock();
 }
 
@@ -134,6 +186,10 @@ template <class T> void pcl_handler(T &msg) {
     pl_ptr->points.pop_back();
 
   mBuf.lock();
+  if (!admit_stamp(StampStream::Cloud, t0)) {
+    mBuf.unlock();
+    return;
+  }
   time_buf.push_back(t0);
   pcl_buf.push_back(pl_ptr);
 
@@ -176,13 +232,26 @@ template <class T> void pcl_handler(T &msg) {
 
 bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
                    deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu) {
-  static bool pl_ready = false;
+  if (pl_ready) {
+    // Drop a waiting cloud from before a step here, not only once its IMU
+    // arrives: after a backward step no new IMU stamp ever reaches its end.
+    mBuf.lock();
+    const bool stale = pl_epoch != stamp_guard.epoch();
+    mBuf.unlock();
+    if (stale)
+      pl_ready = false;
+  }
 
   if (!pl_ready) {
     if (pcl_buf.empty())
       return false;
 
     mBuf.lock();
+    if (pcl_buf.empty()) {
+      mBuf.unlock();
+      return false;
+    }
+    pl_epoch = stamp_guard.epoch();
     pl_ptr = pcl_buf.front();
     p_imu.pcl_beg_time = time_buf.front();
     pcl_buf.pop_front();
@@ -222,6 +291,13 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
   }
 
   mBuf.lock();
+  // A step since the cloud was popped discarded the IMU it was waiting for,
+  // and the cloud is on the old time base.
+  if (pl_epoch != stamp_guard.epoch() || imu_buf.empty()) {
+    mBuf.unlock();
+    pl_ready = false;
+    return false;
+  }
   double imu_time = imu_buf.front()->header.stamp.toSec();
   while ((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) {
     imu_time = imu_buf.front()->header.stamp.toSec();

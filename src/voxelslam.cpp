@@ -3,6 +3,7 @@
 #include "reset_attempt_policy.hpp"
 #include "odom_publish_policy.hpp"
 #include "gravity_align.hpp"
+#include "seed_plausibility.hpp"
 
 #include "nav_msgs/Odometry.h"
 #include "ros/time.h"
@@ -1108,6 +1109,22 @@ public:
     ResetAttemptPolicy reset_attempt_policy_;
     int init_escalations_ = 0;
     double last_full_reset_time_ = -1.0;
+
+    // Bounds on a pose taken from the external transform, the last pose this
+    // estimator trusted, and what the most recent seed attempt did. While a
+    // seed is withheld nothing anchors the pose, including a successful
+    // initialisation, until a later seed is accepted.
+    SeedBounds seed_bounds_;
+    TrustedPose trusted_pose_;
+    SeedStatus last_seed_status_ = SeedStatus::None;
+    SeedStatus last_seed_rejection_ = SeedStatus::None;
+    bool seed_withheld_ = false;
+
+    // Stamp steps already acted on (see stamp_guard.hpp), and how many.
+    uint64_t stamp_epoch_handled_ = 0;
+    uint32_t stamp_discontinuities_ = 0;
+    // Set by a stamp step: frames initialization() holds are on the old clock.
+    bool clear_init_window_ = false;
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
@@ -1246,22 +1263,90 @@ public:
         }
     }
 
-    bool syncStatePositionAndYawToExternal(IMUST& state,
-                                           const Eigen::Vector2d& roll_pitch,
-                                           double timeout_sec,
-                                           std::string* error_message = nullptr)
+    enum class SeedOutcome
+    {
+        Unavailable,  // no transform
+        Accepted,     // seeded from the transform
+        Fallback,     // transform rejected; seeded from the last trusted pose
+        Withheld      // transform rejected and nothing to fall back to
+    };
+
+    static double yawOf(const Eigen::Matrix3d& R)
+    {
+        return std::atan2(R(1, 0), R(0, 0));
+    }
+
+    // Seeds position and yaw from the external transform, if it passes the
+    // seed bounds. On rejection the state is seeded from the last trusted
+    // pose if there is a recent one, and is left untouched otherwise.
+    SeedOutcome seedStateFromExternal(IMUST& state, const Eigen::Vector2d& roll_pitch,
+                                      double timeout_sec, std::string* error_message = nullptr)
     {
         Eigen::Vector3d position;
         double yaw = 0.0;
         if (!lookupExternalOdomPositionAndYaw(position, yaw, timeout_sec,
                                               error_message))
         {
-            return false;
+            return SeedOutcome::Unavailable;
         }
 
-        state.p = position;
-        state.R = makeRotationFromRollPitchYaw(roll_pitch.x(), roll_pitch.y(), yaw);
-        return true;
+        const double now = ros::Time::now().toSec();
+        const SeedVerdict verdict =
+                checkSeed(position, yaw, seed_bounds_, trusted_pose_, now);
+        if (verdict.status == SeedStatus::Accepted)
+        {
+            last_seed_status_ = SeedStatus::Accepted;
+            last_seed_rejection_ = SeedStatus::None;
+            seed_withheld_ = false;
+            state.p = position;
+            state.R = makeRotationFromRollPitchYaw(roll_pitch.x(), roll_pitch.y(), yaw);
+            return SeedOutcome::Accepted;
+        }
+
+        const SeedStatus fallback = chooseFallback(seed_bounds_, trusted_pose_, now);
+        ROS_ERROR_STREAM_THROTTLE(1.0, "Refusing to seed from TF " << odom_link << " -> " << base_link
+                         << ": p=[" << position.transpose() << "] yaw=" << yaw << " "
+                         << seedStatusName(verdict.status) << " (" << verdict.value
+                         << " > " << verdict.limit << "). "
+                         << (fallback == SeedStatus::FallbackTrusted
+                                     ? "Seeding from the last trusted pose instead"
+                                     : "No recent trusted pose; withholding the pose until a seed is accepted")
+                         << ", trusted p=[" << trusted_pose_.p.transpose() << "] age "
+                         << (trusted_pose_.valid ? now - trusted_pose_.time : -1.0) << " s");
+        last_seed_status_ = fallback;
+        last_seed_rejection_ = verdict.status;
+        if (fallback == SeedStatus::FallbackTrusted)
+        {
+            seed_withheld_ = false;
+            state.p = trusted_pose_.p;
+            state.R = makeRotationFromRollPitchYaw(roll_pitch.x(), roll_pitch.y(),
+                                                   trusted_pose_.yaw);
+            return SeedOutcome::Fallback;
+        }
+        seed_withheld_ = true;
+        return SeedOutcome::Withheld;
+    }
+
+    // Records the current pose as trusted if this frame is healthy by every
+    // measure available here. Only a trusted pose may stand in for a rejected
+    // seed, so a frame that has just integrated garbage must not qualify.
+    void updateTrustedPose(bool estimation_success, bool motion_stable,
+                           DegradeState degrade)
+    {
+        if (!initialized_ || !g_has_anchor || g_pose_source != PoseSource::Estimate ||
+            !estimation_success || !motion_stable || degrade != DegradeState::Ok)
+            return;
+        if (!x_curr.p.allFinite() || !x_curr.v.allFinite())
+            return;
+        if (seed_bounds_.max_radius_m > 0.0 &&
+            x_curr.p.head<2>().norm() > seed_bounds_.max_radius_m)
+            return;
+        if (seed_bounds_.max_speed_mps > 0.0 && x_curr.v.norm() > seed_bounds_.max_speed_mps)
+            return;
+        trusted_pose_.valid = true;
+        trusted_pose_.p = x_curr.p;
+        trusted_pose_.yaw = yawOf(x_curr.R);
+        trusted_pose_.time = ros::Time::now().toSec();
     }
 
     // Metrics we already compute (exposed via diagnostics)
@@ -1390,6 +1475,25 @@ public:
         std::cout << "Lidar type: " << feat.lidar_type << std::endl;
         std::cout << "Topic: " << lid_topic << std::endl;
 
+        // Before subscribing: the guard sees every message.
+        StampGuardConfig stamp_cfg;
+        n.param<double>("Timing/imu_max_gap_sec", stamp_cfg.imu_max_gap_s, 0.5);
+        n.param<double>("Timing/imu_max_backstep_sec", stamp_cfg.imu_max_backstep_s, 0.05);
+        n.param<double>("Timing/cloud_max_gap_sec", stamp_cfg.cloud_max_gap_s, 0.0);
+        n.param<double>("Timing/max_cross_stream_offset_sec",
+                        stamp_cfg.max_cross_stream_offset_s, 1.0);
+        n.param<double>("Timing/max_host_offset_sec", stamp_cfg.max_host_offset_s, 0.0);
+        n.param<double>("Timing/settle_sec", stamp_cfg.settle_s, 1.0);
+        {
+            lock_guard<mutex> lock(mBuf);
+            stamp_guard = StampGuard(stamp_cfg);
+        }
+        ROS_INFO("Stamp guard: imu gap %.3f s, imu backstep %.3f s, cloud gap %.3f s, "
+                 "cross-stream %.3f s, host %.3f s, settle %.3f s (0 disables)",
+                 stamp_cfg.imu_max_gap_s, stamp_cfg.imu_max_backstep_s,
+                 stamp_cfg.cloud_max_gap_s, stamp_cfg.max_cross_stream_offset_s,
+                 stamp_cfg.max_host_offset_s, stamp_cfg.settle_s);
+
         sub_imu = n.subscribe(imu_topic, 80000, imu_handler);
         if (feat.lidar_type == LIVOX)
             sub_pcl = n.subscribe<livox_ros_driver2::CustomMsg>(lid_topic, 1000,
@@ -1449,6 +1553,10 @@ public:
         n.param<int>("Reset/staticness_min_samples",
                      staticness_gate_.min_samples, 100);
         n.param<double>("Reset/staticness_speed_max", staticness_gate_.speed_max, 0.05);
+        n.param<double>("Reset/max_seed_radius_m", seed_bounds_.max_radius_m, 0.0);
+        n.param<double>("Reset/max_seed_jump_m", seed_bounds_.max_jump_m, 0.0);
+        n.param<double>("Reset/max_seed_speed_mps", seed_bounds_.max_speed_mps, 0.0);
+        n.param<double>("Reset/max_trusted_age_sec", seed_bounds_.max_trusted_age_s, 30.0);
         n.param<double>("Reset/escalate_after_sec",
                         reset_attempt_policy_.escalate_after_s, 5.0);
         n.param<double>("Reset/escalate_growth",
@@ -1551,8 +1659,9 @@ public:
         if (use_odom_init_tf)
         {
             std::string tf_error;
-            if (syncStatePositionAndYawToExternal(x_curr, Eigen::Vector2d::Zero(),
-                                                  1.0, &tf_error))
+            const SeedOutcome seeded = seedStateFromExternal(
+                    x_curr, Eigen::Vector2d::Zero(), 1.0, &tf_error);
+            if (seeded == SeedOutcome::Accepted)
             {
                 x_curr.v.setZero();
                 g_has_anchor = true;
@@ -1562,6 +1671,12 @@ public:
                                                               << base_link
                                                               << " using x/y/z/yaw: p=["
                                                               << x_curr.p.transpose() << "]");
+            }
+            else if (seeded == SeedOutcome::Withheld || seeded == SeedOutcome::Fallback)
+            {
+                // Nothing has been trusted yet, so there is no fallback: the
+                // rejection has already been logged, and the pose stays
+                // unanchored.
             }
             else
             {
@@ -1819,6 +1934,42 @@ public:
         }
     }
 
+    // The input stamps stepped (see stamp_guard.hpp) and have since settled on
+    // a new time base; `imus` is the first batch on it. The state is still the
+    // one from before the step - nothing across it was integrated - but the
+    // window links frames by stamp and cannot span the step, so this is a full
+    // reset, run once per episode however often the clock stepped while it
+    // settled. It is done here rather than when the step is seen because a
+    // reset needs a batch of IMU to initialise from.
+    void resetAfterStampStep(deque<sensor_msgs::Imu::Ptr>& imus, Eigen::Vector3d& last_pos,
+                             double& jour, bool& motion_init_flag)
+    {
+        stamp_discontinuities_++;
+        string step;
+        {
+            lock_guard<mutex> lock(mBuf);
+            step = stamp_step_reason;
+        }
+        forceReset("Timestamp discontinuity: " + step + "; reset on the new time base",
+                   imus, last_pos, jour, motion_init_flag, true);
+
+        // Time state the reset does not own. forceReset has already taken
+        // last_full_reset_time_ from this batch, so escalation is measured on
+        // the new base.
+        odom_ekf.last_pcl_end_time = odom_ekf.pcl_end_time;
+        last_pcl_time = -1;
+        clear_init_window_ = true;
+        // The levelling window and any unspent gravity datum are keyed by the
+        // old clock. The reset above has used them against the pre-step state,
+        // which is what they were measured on; afterwards they would be
+        // compared against stamps on the new base.
+        imu_level_time_.clear();
+        imu_level_acc_.clear();
+        imu_level_gyr_.clear();
+        datum_correction_ = Eigen::Matrix3d::Identity();
+        datum_stamp_ = -1.0;
+    }
+
     void pub_diagnostics(double stamp,
                          bool estimation_success,
                          int degrade_cnt,
@@ -1843,6 +1994,23 @@ public:
                               voxel_slam::LIODiag::POSE_SOURCE_EXTERNAL,
                       "PoseSource must match the LIODiag constants");
         msg.pose_source = static_cast<uint8_t>(g_pose_source);
+        static_assert(static_cast<uint8_t>(SeedStatus::None) == voxel_slam::LIODiag::SEED_NONE &&
+                              static_cast<uint8_t>(SeedStatus::Accepted) ==
+                                      voxel_slam::LIODiag::SEED_ACCEPTED &&
+                              static_cast<uint8_t>(SeedStatus::RejectedNonFinite) ==
+                                      voxel_slam::LIODiag::SEED_REJECTED_NONFINITE &&
+                              static_cast<uint8_t>(SeedStatus::RejectedRadius) ==
+                                      voxel_slam::LIODiag::SEED_REJECTED_RADIUS &&
+                              static_cast<uint8_t>(SeedStatus::RejectedJump) ==
+                                      voxel_slam::LIODiag::SEED_REJECTED_JUMP &&
+                              static_cast<uint8_t>(SeedStatus::FallbackTrusted) ==
+                                      voxel_slam::LIODiag::SEED_FALLBACK_TRUSTED &&
+                              static_cast<uint8_t>(SeedStatus::Withheld) ==
+                                      voxel_slam::LIODiag::SEED_WITHHELD,
+                      "SeedStatus must match the LIODiag constants");
+        msg.seed_status = static_cast<uint8_t>(last_seed_status_);
+        msg.seed_rejection = static_cast<uint8_t>(last_seed_rejection_);
+        msg.stamp_discontinuities = stamp_discontinuities_;
         msg.header.frame_id = odom_link;
 
         msg.initialized = initialized_;
@@ -2618,6 +2786,14 @@ public:
         static vector<double> beg_times;
         static vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
 
+        if (clear_init_window_)
+        {
+            pl_origs.clear();
+            beg_times.clear();
+            vec_imus.clear();
+            clear_init_window_ = false;
+        }
+
         pcl::PointCloud<PointType>::Ptr orig(
                 new pcl::PointCloud<PointType>(*pcl_curr));
         if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
@@ -2801,8 +2977,24 @@ public:
         if (use_odom_init_tf)
         {
             std::string tf_error;
-            if (syncStatePositionAndYawToExternal(x_curr, preserved_roll_pitch,
-                                                  0.5, &tf_error))
+            const SeedOutcome seeded =
+                    seedStateFromExternal(x_curr, preserved_roll_pitch, 0.5, &tf_error);
+            if (seeded == SeedOutcome::Fallback)
+            {
+                // The estimator's own last healthy pose, not the transform's.
+                initialized_from_tf = true;
+                g_has_anchor = true;
+                g_pose_source = PoseSource::Estimate;
+                markPoseDiscontinuity();
+                ROS_WARN_STREAM("Reset to last trusted pose using x/y/z/yaw: p=["
+                                << x_curr.p.transpose() << "]");
+            }
+            else if (seeded == SeedOutcome::Withheld)
+            {
+                // Falls through to the unanchored start below; seed_withheld_
+                // keeps initialisation from anchoring it.
+            }
+            else if (seeded == SeedOutcome::Accepted)
             {
                 initialized_from_tf = true;
                 g_has_anchor = true;
@@ -3116,10 +3308,13 @@ public:
                 if (use_external_odom_tf)
                 {
                     const Eigen::Vector2d preserved_roll_pitch = extractRollPitch(x_curr.R);
-                    if (syncStatePositionAndYawToExternal(x_curr,
-                                                          preserved_roll_pitch,
-                                                          0.0, nullptr))
+                    // A rejected transform is not followed, not even with a
+                    // fallback: in this mode the transform is the only source.
+                    IMUST candidate = x_curr;
+                    if (seedStateFromExternal(candidate, preserved_roll_pitch, 0.0,
+                                              nullptr) == SeedOutcome::Accepted)
                     {
+                        x_curr = candidate;
                         x_curr.v.setZero();
                         g_has_anchor = true;
                         g_pose_source = PoseSource::External;
@@ -3192,6 +3387,18 @@ public:
                 continue;
             }
 
+            // The first batch after a stamp step: reset onto the new time base
+            // before anything integrates across it. pl_epoch is the epoch this
+            // batch was checked against, not the current one, so a step
+            // arriving after it was taken is handled on the next batch.
+            if (pl_epoch != stamp_epoch_handled_)
+            {
+                stamp_epoch_handled_ = pl_epoch;
+                resetAfterStampStep(imus, last_pos, jour, motion_init_flag);
+                degrade_cnt = 0;
+                continue;
+            }
+
             // Drain the queue while frames are arriving as well. Once the
             // pipeline falls behind, sync_packages() always has a frame ready,
             // the branch above stops being taken, and every subsequent teardown
@@ -3236,9 +3443,23 @@ public:
                     estimation_success = true;
                     init_escalations_ = 0;
                     g_is_initializing = false;
-                    g_has_anchor = true;
-                    g_pose_source = PoseSource::Estimate;
-                    markPoseDiscontinuity();
+                    if (seed_withheld_)
+                    {
+                        // Initialised from an unanchored start after a seed
+                        // was refused. The pose is relative to nothing, so
+                        // it is not published.
+                        g_has_anchor = false;
+                        g_pose_source = PoseSource::None;
+                        ROS_ERROR_THROTTLE(10.0, "Initialised, but not publishing a pose: the "
+                                                 "external seed was refused and no trusted "
+                                                 "pose was available");
+                    }
+                    else
+                    {
+                        g_has_anchor = true;
+                        g_pose_source = PoseSource::Estimate;
+                        markPoseDiscontinuity();
+                    }
                 }
                 else
                 {
@@ -3443,6 +3664,8 @@ public:
                     degrade_cnt = 0;
                     continue;
                 }
+
+                updateTrustedPose(estimation_success, motion_stable, active_degrade_state_post);
 
                 if (active_degrade_state_post == DegradeState::Low)
                 {

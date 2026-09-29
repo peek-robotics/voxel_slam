@@ -131,4 +131,20 @@ if(CATKIN_ENABLE_TESTING)
     ${PCL_INCLUDE_DIRS}
   )
   target_link_libraries(test_gravity_align gtest_main ${PCL_LIBRARIES})
+
+  catkin_add_gtest(test_stamp_guard test/test_stamp_guard.cpp)
+  target_include_directories(test_stamp_guard BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_stamp_guard gtest_main ${PCL_LIBRARIES})
+
+  catkin_add_gtest(test_seed_plausibility test/test_seed_plausibility.cpp)
+  target_include_directories(test_seed_plausibility BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_seed_plausibility gtest_main ${PCL_LIBRARIES})
 endif()
