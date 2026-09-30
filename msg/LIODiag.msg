@@ -21,6 +21,26 @@ uint8 POSE_SOURCE_ESTIMATE=1  # lidar-inertial estimate
 uint8 POSE_SOURCE_EXTERNAL=2  # seeded from the external odometry transform
 uint8 pose_source
 
+# The most recent attempt to seed the pose from the external transform (at
+# startup or a reset). A seed is refused if it is not finite, lies beyond
+# Reset/max_seed_radius_m of the origin, or is further from the last trusted
+# pose than the Reset/max_seed_jump_m allowance. A refused seed falls back to
+# that trusted pose when it is recent; otherwise no pose is published until a
+# later seed is accepted. seed_status is the outcome, seed_rejection the bound
+# that refused it; both take the SEED_ constants.
+uint8 SEED_NONE=0                # no seed attempted yet / not refused
+uint8 SEED_ACCEPTED=1
+uint8 SEED_REJECTED_NONFINITE=2
+uint8 SEED_REJECTED_RADIUS=3
+uint8 SEED_REJECTED_JUMP=4
+uint8 SEED_FALLBACK_TRUSTED=5    # refused; seeded from the last trusted pose
+uint8 SEED_WITHHELD=6            # refused; no pose is published
+uint8 seed_status
+uint8 seed_rejection
+
+# Header stamp steps on the IMU or scan input that forced a reset since node start.
+uint32 stamp_discontinuities
+
 # ===== DEGENERACY / HEALTH =====
 int32 degrade_cnt                 # Degeneracy counter (increments on estimation failure; decrements on stable success)
 int32 combined_degradation        # degrade_cnt + wheel_odom_violation_count
