@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
+#include <set>
+#include <vector>
 
 namespace
 {
@@ -12,6 +15,11 @@ MapDecayPolicy policy(double decay_sec)
   p.decay_sec = decay_sec;
   return p;
 }
+
+struct FakeVoxel
+{
+  double last_seen_t;
+};
 
 } // namespace
 
@@ -61,3 +69,77 @@ TEST(MapDecayPolicy, StationaryVehicleStillAges)
                                stamped_while_parked, p));
 }
 
+// --- sweep -----------------------------------------------------------------
+
+namespace
+{
+
+// A map shaped like surf_map: key -> owning pointer, with the sweep handing
+// evicted pointers to `retire` instead of freeing them.
+struct SweepFixture
+{
+  std::vector<FakeVoxel> storage;
+  std::map<int, FakeVoxel*> map;
+  std::set<int> in_window;
+  std::vector<FakeVoxel*> retired;
+
+  explicit SweepFixture(const std::vector<double>& stamps) : storage(stamps.size())
+  {
+    for (size_t i = 0; i < stamps.size(); ++i)
+    {
+      storage[i].last_seen_t = stamps[i];
+      map[static_cast<int>(i)] = &storage[i];
+    }
+  }
+
+  int sweep(double now, const MapDecayPolicy& p)
+  {
+    return sweepDecayedVoxels(
+            map, now, p, [this](int k) { return in_window.count(k) != 0; },
+            [this](FakeVoxel* v) { retired.push_back(v); });
+  }
+};
+
+} // namespace
+
+TEST(MapDecayPolicy, SweepRemovesOnlyStaleVoxelsAndRetiresEachOnce)
+{
+  SweepFixture f({10.0, 500.0, 50.0, 790.0, -1.0});
+  EXPECT_EQ(f.sweep(800.0, policy(300.0)), 2);
+
+  EXPECT_EQ(f.map.size(), 3u);
+  EXPECT_EQ(f.map.count(0), 0u);
+  EXPECT_EQ(f.map.count(2), 0u);
+  ASSERT_EQ(f.retired.size(), 2u);
+  EXPECT_EQ(f.retired[0], &f.storage[0]);
+  EXPECT_EQ(f.retired[1], &f.storage[2]);
+}
+
+TEST(MapDecayPolicy, SweepSparesVoxelsTheSlidingWindowStillHolds)
+{
+  // Freeing a voxel the local BA still references is a use-after-free, so the
+  // window's veto outranks age.
+  SweepFixture f({10.0, 20.0});
+  f.in_window.insert(0);
+  EXPECT_EQ(f.sweep(800.0, policy(300.0)), 1);
+  EXPECT_EQ(f.map.count(0), 1u);
+  EXPECT_EQ(f.map.count(1), 0u);
+}
+
+TEST(MapDecayPolicy, SweepIsANoOpWhenDisabledOrBeforeTheFirstScan)
+{
+  SweepFixture f({10.0, 20.0});
+  EXPECT_EQ(f.sweep(800.0, policy(0.0)), 0);
+  // now <= 0 is "no scan time yet"; nothing can be judged old against it.
+  EXPECT_EQ(f.sweep(0.0, policy(300.0)), 0);
+  EXPECT_EQ(f.map.size(), 2u);
+  EXPECT_TRUE(f.retired.empty());
+}
+
+TEST(MapDecayPolicy, SweepEmptiesAMapThatIsEntirelyStale)
+{
+  // Erase-while-iterating over every element, including the last.
+  SweepFixture f({1.0, 2.0, 3.0, 4.0});
+  EXPECT_EQ(f.sweep(1000.0, policy(300.0)), 4);
+  EXPECT_TRUE(f.map.empty());
+}

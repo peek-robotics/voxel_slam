@@ -3247,26 +3247,16 @@ public:
     // Runs on the odometry thread, the only writer of surf_map.
     int decay_surf_map(double now)
     {
-        if (map_decay_.decay_sec <= 0.0 || now <= 0.0)
-            return 0;
-
-        int evicted = 0;
-        for (auto iter = surf_map.begin(); iter != surf_map.end();)
-        {
-            OctoTree* oc = iter->second;
-            if (!shouldEvictVoxel(now, oc->last_seen_t, map_decay_) ||
-                surf_map_slide.find(iter->first) != surf_map_slide.end())
-            {
-                iter++;
-                continue;
-            }
-
-            oc->clear_slwd(sws[0]);
-            oc->tras_ptr(octos_release);
-            octos_release.push_back(oc);
-            surf_map.erase(iter++);
-            evicted++;
-        }
+        const int evicted = sweepDecayedVoxels(
+                surf_map, now, map_decay_,
+                [this](const VOXEL_LOC& loc)
+                { return surf_map_slide.find(loc) != surf_map_slide.end(); },
+                [this](OctoTree* oc)
+                {
+                    oc->clear_slwd(sws[0]);
+                    oc->tras_ptr(octos_release);
+                    octos_release.push_back(oc);
+                });
 
         if (evicted > 0)
         {

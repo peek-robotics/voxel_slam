@@ -45,4 +45,35 @@ inline bool shouldEvictVoxel(double now, double last_seen_t,
   return (now - last_seen_t) > p.decay_sec;
 }
 
+// One eviction pass over a voxel map keyed by root voxel. Returns the number
+// of entries removed.
+//
+// `map` is any associative container whose mapped values point at a node
+// with a `last_seen_t` member. `in_use(key)` vetoes eviction of a voxel the
+// caller still depends on (the sliding window); `retire(node)` takes
+// ownership of an evicted node before it leaves the map. The pass only
+// erases - freeing is the caller's business, so it can be deferred.
+template <typename Map, typename InUse, typename Retire>
+int sweepDecayedVoxels(Map& map, double now, const MapDecayPolicy& p,
+                       InUse&& in_use, Retire&& retire)
+{
+  if (p.decay_sec <= 0.0 || now <= 0.0)
+    return 0;
+
+  int evicted = 0;
+  for (auto iter = map.begin(); iter != map.end();)
+  {
+    if (!shouldEvictVoxel(now, iter->second->last_seen_t, p) ||
+        in_use(iter->first))
+    {
+      ++iter;
+      continue;
+    }
+    retire(iter->second);
+    iter = map.erase(iter);
+    evicted++;
+  }
+  return evicted;
+}
+
 #endif // MAP_DECAY_POLICY_HPP
