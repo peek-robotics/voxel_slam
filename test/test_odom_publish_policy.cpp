@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <Eigen/Eigenvalues>
+
 #include "odom_publish_policy.hpp"
 
 namespace
@@ -175,4 +177,206 @@ TEST(OdomPublishPolicy, NonPositiveBlockKeepsItsDiagonalRatherThanClaimingCertai
   for (int i = 3; i < 6; ++i)
     EXPECT_EQ(cov[i * 6 + i], 4.0) << "angular diagonal " << i;
   EXPECT_EQ(cov[1], 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Directional degraded covariance
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+const double kConstrainedVar = 1e-2;
+
+OdomPublishPolicy decideDirectional(bool initializing, DegradeState d,
+                                    bool directional,
+                                    double constrained = kConstrainedVar)
+{
+  return decideOdomPublish(true, initializing, d, kDiscFrames, kDiscFrames,
+                           kDiscVar, kUncVar, -1.0, -1.0, directional,
+                           constrained);
+}
+
+} // namespace
+
+TEST(OdomPublishPolicy, DirectionalIsOptInAndDefaultsToTheIsotropicAnswer)
+{
+  // Every existing caller passes neither of the new arguments, so the
+  // behaviour they see must be byte-identical to before.
+  const OdomPublishPolicy p =
+          decideOdomPublish(true, false, DegradeState::High, kDiscFrames,
+                            kDiscFrames, kDiscVar, kUncVar);
+  EXPECT_EQ(p.pose_position_absolute, kUncVar);
+  EXPECT_EQ(p.pose_position_directional, 0.0);
+  EXPECT_TRUE(p.zero_off_diagonal);
+}
+
+TEST(OdomPublishPolicy, DirectionalSplitsTheDegradedPositionBlock)
+{
+  const OdomPublishPolicy p =
+          decideDirectional(false, DegradeState::High, true);
+  // The absolute replacement is stood down in favour of the two-part answer.
+  EXPECT_EQ(p.pose_position_absolute, 0.0);
+  EXPECT_EQ(p.pose_position_constrained, kConstrainedVar);
+  // Along the weak direction the total is exactly the isotropic value, so the
+  // directional answer is never the more optimistic of the two there.
+  EXPECT_DOUBLE_EQ(p.pose_position_constrained + p.pose_position_directional,
+                   kUncVar);
+  // Orientation and twist are untouched by this - only position has a
+  // direction to speak of.
+  EXPECT_EQ(p.pose_orientation_absolute, kUncVar);
+  EXPECT_EQ(p.twist_absolute, kUncVar);
+}
+
+TEST(OdomPublishPolicy, InitialisationIsNeverAnsweredDirectionally)
+{
+  // The pose is re-seeded from an external transform while initialising, so
+  // its error is that transform's, not the LiDAR's line of sight.
+  const OdomPublishPolicy p = decideDirectional(true, DegradeState::Ok, true);
+  EXPECT_EQ(p.pose_position_absolute, kUncVar);
+  EXPECT_EQ(p.pose_position_directional, 0.0);
+}
+
+TEST(OdomPublishPolicy, UniformlyWeakScanStaysIsotropic)
+{
+  // The caller reports directional=false when the observability ratio says
+  // the scan is weak in every direction, or when the degradation came from
+  // the wheel watchdog rather than from LiDAR geometry.
+  const OdomPublishPolicy p =
+          decideDirectional(false, DegradeState::High, false);
+  EXPECT_EQ(p.pose_position_absolute, kUncVar);
+  EXPECT_EQ(p.pose_position_directional, 0.0);
+}
+
+TEST(OdomPublishPolicy, NonsenseConstrainedVarianceFallsBackToIsotropic)
+{
+  for (double bad : {0.0, -1.0, kUncVar, kUncVar * 10.0})
+  {
+    const OdomPublishPolicy p =
+            decideDirectional(false, DegradeState::High, true, bad);
+    EXPECT_EQ(p.pose_position_absolute, kUncVar) << "constrained " << bad;
+    EXPECT_EQ(p.pose_position_directional, 0.0) << "constrained " << bad;
+  }
+}
+
+TEST(OdomPublishPolicy, DiscontinuityOutranksDirectional)
+{
+  // A pose jump is a step in every direction at once; there is nothing
+  // directional about it, and it must keep winning over degradation.
+  const OdomPublishPolicy p =
+          decideOdomPublish(true, false, DegradeState::High, 0, kDiscFrames,
+                            kDiscVar, kUncVar, -1.0, -1.0, true,
+                            kConstrainedVar);
+  EXPECT_EQ(p.pose_position_absolute, kDiscVar);
+  EXPECT_EQ(p.pose_position_directional, 0.0);
+}
+
+TEST(OdomPublishPolicy, DirectionalBlockIsAnisotropicAndPositiveDefinite)
+{
+  double cov[36];
+  for (int k = 0; k < 36; ++k)
+    cov[k] = 0.0;
+
+  const Eigen::Vector3d corridor_dir(1.0, 0.0, 0.0); // along the corridor
+  applyDirectionalPositionCovariance(cov, corridor_dir, 1e-2, 1e3 - 1e-2);
+
+  Eigen::Matrix3d block;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      block(i, j) = cov[i * 6 + j];
+
+  // Blind along the corridor, sharp across it and vertically - which is the whole
+  // point: one number cannot say this.
+  EXPECT_NEAR(block(0, 0), 1e3, 1e-6);
+  EXPECT_NEAR(block(1, 1), 1e-2, 1e-9);
+  EXPECT_NEAR(block(2, 2), 1e-2, 1e-9);
+
+  EXPECT_TRUE(block.isApprox(block.transpose()));
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(block);
+  EXPECT_GT(es.eigenvalues()(0), 0.0) << "block must be positive definite";
+}
+
+TEST(OdomPublishPolicy, DirectionalBlockFollowsAnArbitraryDirection)
+{
+  double cov[36];
+  for (int k = 0; k < 36; ++k)
+    cov[k] = 0.0;
+
+  // Deliberately not unit length: the caller hands over a raw eigenvector.
+  const Eigen::Vector3d dir(3.0, 4.0, 0.0);
+  applyDirectionalPositionCovariance(cov, dir, 2.0, 100.0);
+
+  Eigen::Matrix3d block;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      block(i, j) = cov[i * 6 + j];
+
+  const Eigen::Vector3d u = dir.normalized();
+  EXPECT_NEAR((block * u).norm(), 102.0, 1e-9);        // 2 + 100 along u
+  const Eigen::Vector3d perp(-u.y(), u.x(), 0.0);
+  EXPECT_NEAR((block * perp).norm(), 2.0, 1e-9);       // 2 across it
+  EXPECT_NEAR(block(2, 2), 2.0, 1e-9);
+}
+
+TEST(OdomPublishPolicy, UnknownDirectionDegradesToIsotropicRatherThanDividingByZero)
+{
+  double cov[36];
+  for (int k = 0; k < 36; ++k)
+    cov[k] = 0.0;
+  applyDirectionalPositionCovariance(cov, Eigen::Vector3d::Zero(), 5.0, 100.0);
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      EXPECT_NEAR(cov[i * 6 + j], i == j ? 5.0 : 0.0, 1e-12);
+}
+
+TEST(OdomPublishPolicy, DirectionalWriteLeavesTheOrientationBlockAlone)
+{
+  double cov[36];
+  for (int k = 0; k < 36; ++k)
+    cov[k] = 0.0;
+  for (int i = 3; i < 6; ++i)
+    cov[i * 6 + i] = 42.0;
+
+  applyDirectionalPositionCovariance(cov, Eigen::Vector3d::UnitY(), 1.0, 9.0);
+
+  for (int i = 3; i < 6; ++i)
+    EXPECT_EQ(cov[i * 6 + i], 42.0) << "angular diagonal " << i;
+  // And the position-orientation cross terms stay where applyOdomCovariance
+  // left them.
+  for (int i = 0; i < 3; ++i)
+    for (int j = 3; j < 6; ++j)
+      EXPECT_EQ(cov[i * 6 + j], 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// One-sided degeneracy gate
+// ---------------------------------------------------------------------------
+
+TEST(OdomPublishPolicy, CorridorScanIsOneSided)
+{
+  // Two walls and the ground: strong across the corridor and vertically, blind
+  // along it. This is the case the directional regime exists for.
+  EXPECT_TRUE(isOneSidedDegeneracy(Eigen::Vector3d(0.5, 300.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, GroundOnlyScanIsNotOneSided)
+{
+  // Open flat ground: only the ground plane, so both horizontal directions are
+  // unobserved. The weakest/strongest ratio is ~0 and alone would pass, but
+  // the weakest eigenvector is then an arbitrary horizontal axis and the
+  // other one - just as blind - would be published as well known.
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d(0.5, 2.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, UniformlyWeakScanIsNotOneSided)
+{
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d(400.0, 600.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, OneSidedGateIsOffByDefaultAndOnEmptyInput)
+{
+  const Eigen::Vector3d corridor(0.5, 300.0, 1000.0);
+  EXPECT_FALSE(isOneSidedDegeneracy(corridor, 0.0));
+  EXPECT_FALSE(isOneSidedDegeneracy(corridor, -1.0));
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d::Zero(), 0.1));
 }
