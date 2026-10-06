@@ -67,10 +67,13 @@ double g_uncertain_orientation_variance = -1.0;
 // g_pose_source.
 Eigen::Vector3d g_degenerate_dir = Eigen::Vector3d::Zero();
 bool g_degenerate_dir_valid = false;
-double g_degenerate_observability = 1.0;
-// The degraded covariance is answered directionally only below this ratio.
-// Above it the scan is uniformly weak rather than weak in one direction, and
-// one number is then the honest answer. <= 0 disables the directional regime.
+// Ascending eigenvalues of that matrix. Kept whole because a direction is only
+// meaningful when exactly one of them is small - see isOneSidedDegeneracy().
+Eigen::Vector3d g_degenerate_evalues = Eigen::Vector3d::Zero();
+// The degraded covariance is answered directionally only when the weakest
+// eigenvalue is below this fraction of the strongest and the middle one is
+// not. Otherwise the scan is weak in more than one direction, and one number
+// is then the honest answer. <= 0 disables the directional regime.
 double g_directional_observability_max = 0.0;
 // Variance published along the two directions the LiDAR *can* see while
 // degraded. <= 0 keeps the isotropic replacement. See OdomPublishPolicy.
@@ -234,12 +237,14 @@ public:
                 g_degrade_state_tracker ? g_degrade_state_tracker->current()
                                         : DegradeState::Ok;
         // A degeneracy is worth answering directionally only when it is
-        // actually one-sided. The ratio gate keeps a uniformly weak scan, and
-        // a degrade state reached through the wheel watchdog rather than
-        // through LiDAR geometry, on the isotropic path.
+        // actually one-sided. The gate keeps a uniformly weak scan, a scan
+        // weak in two directions, and a degrade state reached through the
+        // wheel watchdog rather than through LiDAR geometry, on the isotropic
+        // path.
         const bool degeneracy_is_directional =
-                g_degenerate_dir_valid && g_directional_observability_max > 0.0 &&
-                g_degenerate_observability <= g_directional_observability_max;
+                g_degenerate_dir_valid &&
+                isOneSidedDegeneracy(g_degenerate_evalues,
+                                     g_directional_observability_max);
 
         const OdomPublishPolicy policy = decideOdomPublish(
                 g_has_anchor, g_is_initializing, degrade_state,
@@ -2307,10 +2312,7 @@ public:
         last_degeneracy_valid_ = (match_num > 0 && evalue[2] > 1e-9);
         g_degenerate_dir = last_degenerate_dir_;
         g_degenerate_dir_valid = last_degeneracy_valid_;
-        g_degenerate_observability =
-                last_degeneracy_valid_
-                        ? static_cast<double>(last_normal_observability_)
-                        : 1.0;
+        g_degenerate_evalues = evalue;
 
         // Wheel-velocity IEKF update: anchors the LIO body-X velocity to the
         // wheel odom after the lidar IEKF has converged. This backstops the
