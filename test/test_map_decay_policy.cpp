@@ -2,8 +2,8 @@
 
 #include <gtest/gtest.h>
 
-#include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -79,9 +79,10 @@ namespace
 struct SweepFixture
 {
   std::vector<FakeVoxel> storage;
-  std::map<int, FakeVoxel*> map;
+  std::unordered_map<int, FakeVoxel*> map;
   std::set<int> in_window;
   std::vector<FakeVoxel*> retired;
+  size_t cursor = 0;
 
   explicit SweepFixture(const std::vector<double>& stamps) : storage(stamps.size())
   {
@@ -92,11 +93,17 @@ struct SweepFixture
     }
   }
 
-  int sweep(double now, const MapDecayPolicy& p)
+  int sweep(double now, const MapDecayPolicy& p, size_t buckets)
   {
     return sweepDecayedVoxels(
-            map, now, p, [this](int k) { return in_window.count(k) != 0; },
+            map, cursor, buckets, now, p,
+            [this](int k) { return in_window.count(k) != 0; },
             [this](FakeVoxel* v) { retired.push_back(v); });
+  }
+
+  int fullSweep(double now, const MapDecayPolicy& p)
+  {
+    return sweep(now, p, map.bucket_count());
   }
 };
 
@@ -105,14 +112,14 @@ struct SweepFixture
 TEST(MapDecayPolicy, SweepRemovesOnlyStaleVoxelsAndRetiresEachOnce)
 {
   SweepFixture f({10.0, 500.0, 50.0, 790.0, -1.0});
-  EXPECT_EQ(f.sweep(800.0, policy(300.0)), 2);
+  EXPECT_EQ(f.fullSweep(800.0, policy(300.0)), 2);
 
   EXPECT_EQ(f.map.size(), 3u);
   EXPECT_EQ(f.map.count(0), 0u);
   EXPECT_EQ(f.map.count(2), 0u);
   ASSERT_EQ(f.retired.size(), 2u);
-  EXPECT_EQ(f.retired[0], &f.storage[0]);
-  EXPECT_EQ(f.retired[1], &f.storage[2]);
+  EXPECT_EQ(std::set<FakeVoxel*>(f.retired.begin(), f.retired.end()),
+            (std::set<FakeVoxel*>{&f.storage[0], &f.storage[2]}));
 }
 
 TEST(MapDecayPolicy, SweepSparesVoxelsTheSlidingWindowStillHolds)
@@ -121,7 +128,7 @@ TEST(MapDecayPolicy, SweepSparesVoxelsTheSlidingWindowStillHolds)
   // window's veto outranks age.
   SweepFixture f({10.0, 20.0});
   f.in_window.insert(0);
-  EXPECT_EQ(f.sweep(800.0, policy(300.0)), 1);
+  EXPECT_EQ(f.fullSweep(800.0, policy(300.0)), 1);
   EXPECT_EQ(f.map.count(0), 1u);
   EXPECT_EQ(f.map.count(1), 0u);
 }
@@ -129,17 +136,59 @@ TEST(MapDecayPolicy, SweepSparesVoxelsTheSlidingWindowStillHolds)
 TEST(MapDecayPolicy, SweepIsANoOpWhenDisabledOrBeforeTheFirstScan)
 {
   SweepFixture f({10.0, 20.0});
-  EXPECT_EQ(f.sweep(800.0, policy(0.0)), 0);
+  EXPECT_EQ(f.fullSweep(800.0, policy(0.0)), 0);
   // now <= 0 is "no scan time yet"; nothing can be judged old against it.
-  EXPECT_EQ(f.sweep(0.0, policy(300.0)), 0);
+  EXPECT_EQ(f.fullSweep(0.0, policy(300.0)), 0);
   EXPECT_EQ(f.map.size(), 2u);
   EXPECT_TRUE(f.retired.empty());
 }
 
 TEST(MapDecayPolicy, SweepEmptiesAMapThatIsEntirelyStale)
 {
-  // Erase-while-iterating over every element, including the last.
   SweepFixture f({1.0, 2.0, 3.0, 4.0});
-  EXPECT_EQ(f.sweep(1000.0, policy(300.0)), 4);
+  EXPECT_EQ(f.fullSweep(1000.0, policy(300.0)), 4);
   EXPECT_TRUE(f.map.empty());
+  EXPECT_EQ(f.fullSweep(1000.0, policy(300.0)), 0);
+}
+
+TEST(MapDecayPolicy, SlicesCoverTheWholeMapInOnePass)
+{
+  // The per-frame call: a pass split into N slices must still reach every
+  // voxel, and no single slice may do the whole pass's work.
+  std::vector<double> stamps(1000, 1.0);
+  SweepFixture f(stamps);
+  const size_t n = f.map.bucket_count();
+  const size_t slices = 10;
+  const size_t per_slice = (n + slices - 1) / slices;
+
+  int largest = 0;
+  for (size_t i = 0; i < slices; ++i)
+    largest = std::max(largest, f.sweep(1000.0, policy(300.0), per_slice));
+
+  EXPECT_TRUE(f.map.empty());
+  EXPECT_EQ(f.retired.size(), 1000u);
+  EXPECT_LT(largest, 1000);
+}
+
+TEST(MapDecayPolicy, SlicingSurvivesARehashBetweenCalls)
+{
+  // surf_map grows between frames, which can rehash it under the cursor. A
+  // voxel that moves bucket may be missed by the pass in progress, but must
+  // be caught by the next one.
+  SweepFixture f(std::vector<double>(100, 1.0));
+  std::vector<FakeVoxel> fresh(5000, FakeVoxel{999.0});
+  const size_t slices = 4;
+
+  for (size_t i = 0; i < slices; ++i)
+  {
+    if (i == 1)
+      for (size_t k = 0; k < fresh.size(); ++k)
+        f.map[100 + static_cast<int>(k)] = &fresh[k];
+    f.sweep(1000.0, policy(300.0), (f.map.bucket_count() + slices - 1) / slices);
+  }
+  for (size_t i = 0; i < slices; ++i)
+    f.sweep(1000.0, policy(300.0), (f.map.bucket_count() + slices - 1) / slices);
+
+  EXPECT_EQ(f.retired.size(), 100u);
+  EXPECT_EQ(f.map.size(), fresh.size());
 }

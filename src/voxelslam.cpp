@@ -1164,11 +1164,13 @@ public:
 
     DegradeStateTracker degrade_state_tracker_;
 
-    // Voxel map decay (map_decay_policy.hpp). The sweep cadence is counted in
-    // windows rather than seconds because it is the map's growth that has to
-    // be outpaced, and the map grows once per window.
+    // Voxel map decay (map_decay_policy.hpp). One pass over the map is spread
+    // across map_decay_interval_ windows, from map_decay_cursor_. The cadence
+    // is counted in windows rather than seconds because it is the map's growth
+    // that has to be outpaced, and the map grows once per window.
     MapDecayPolicy map_decay_;
     int map_decay_interval_ = 10;
+    size_t map_decay_cursor_ = 0;
     long map_voxels_evicted_ = 0;
 
     // Base tuning parameters (used for per-frame scaling; never modified)
@@ -3237,7 +3239,8 @@ public:
     // The nodes are queued onto octos_release rather than deleted here: the
     // recursive OctoTree delete is the expensive half, and
     // release_pending_octos() already drains that queue under a time budget on
-    // every frame. The sweep itself is a pointer walk over the root map.
+    // every frame. Each call checks one slice of the root map, so that a pass
+    // over a large map does not stall a single frame; see sweepDecayedVoxels().
     //
     // A voxel the sliding window still holds is spared, so it is never freed
     // underneath the local BA. multi_margi() drops voxels from surf_map_slide
@@ -3247,8 +3250,12 @@ public:
     // Runs on the odometry thread, the only writer of surf_map.
     int decay_surf_map(double now)
     {
+        // One pass every map_decay_interval_ frames, a slice per frame.
+        const size_t buckets =
+                (surf_map.bucket_count() + map_decay_interval_ - 1) /
+                map_decay_interval_;
         const int evicted = sweepDecayedVoxels(
-                surf_map, now, map_decay_,
+                surf_map, map_decay_cursor_, buckets, now, map_decay_,
                 [this](const VOXEL_LOC& loc)
                 { return surf_map_slide.find(loc) != surf_map_slide.end(); },
                 [this](OctoTree* oc)
@@ -3781,11 +3788,8 @@ public:
                 // rule this replaces, this fires while the vehicle is parked -
                 // a stationary vehicle observing moving objects used to grow the
                 // map without bound because the distance counter never moved.
-                if (map_decay_interval_ > 0 &&
-                    (win_base + win_count) % map_decay_interval_ == 0)
-                {
+                if (map_decay_interval_ > 0)
                     decay_surf_map(x_curr.t);
-                }
 
                 if ((win_base + win_count) % 10 == 0)
                 {

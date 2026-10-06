@@ -20,6 +20,9 @@
 // derived from the pose estimate, so a degenerate, drifting LIO does not
 // evict its own map on travel that never happened.
 
+#include <cstddef>
+#include <vector>
+
 struct MapDecayPolicy
 {
   // [s] of scan time since a voxel was last observed, past which it is
@@ -45,35 +48,53 @@ inline bool shouldEvictVoxel(double now, double last_seen_t,
   return (now - last_seen_t) > p.decay_sec;
 }
 
-// One eviction pass over a voxel map keyed by root voxel. Returns the number
-// of entries removed.
+// Checks the next `buckets` hash buckets of a voxel map keyed by root voxel
+// for voxels to evict, starting at `cursor`, and advances `cursor` past them.
+// Returns the number of entries removed.
 //
-// `map` is any associative container whose mapped values point at a node
-// with a `last_seen_t` member. `in_use(key)` vetoes eviction of a voxel the
-// caller still depends on (the sliding window); `retire(node)` takes
-// ownership of an evicted node before it leaves the map. The pass only
-// erases - freeing is the caller's business, so it can be deferred.
+// A whole-map pass is a pointer walk over every voxel, and on a large map
+// that is long enough to stall the frame it runs in. Called once per frame
+// with buckets = bucket_count() / N, it spreads one pass over N frames at a
+// bounded cost each, and still checks every voxel once per N frames.
+//
+// Erasing never rehashes, so the bucket count is fixed within a call. An
+// insertion between calls may rehash and move voxels between buckets; a
+// voxel skipped that way is simply checked on a later pass.
+//
+// `map` is an unordered associative container whose mapped values point at a
+// node with a `last_seen_t` member. `in_use(key)` vetoes eviction of a voxel
+// the caller still depends on (the sliding window); `retire(node)` takes
+// ownership of an evicted node before it leaves the map. Only erases -
+// freeing is the caller's business, so it can be deferred.
 template <typename Map, typename InUse, typename Retire>
-int sweepDecayedVoxels(Map& map, double now, const MapDecayPolicy& p,
-                       InUse&& in_use, Retire&& retire)
+int sweepDecayedVoxels(Map& map, size_t& cursor, size_t buckets, double now,
+                       const MapDecayPolicy& p, InUse&& in_use, Retire&& retire)
 {
-  if (p.decay_sec <= 0.0 || now <= 0.0)
+  if (p.decay_sec <= 0.0 || now <= 0.0 || map.empty())
     return 0;
 
-  int evicted = 0;
-  for (auto iter = map.begin(); iter != map.end();)
+  const size_t n = map.bucket_count();
+  if (buckets > n)
+    buckets = n;
+
+  std::vector<typename Map::key_type> stale;
+  for (size_t i = 0; i < buckets; ++i)
   {
-    if (!shouldEvictVoxel(now, iter->second->last_seen_t, p) ||
-        in_use(iter->first))
-    {
-      ++iter;
-      continue;
-    }
-    retire(iter->second);
-    iter = map.erase(iter);
-    evicted++;
+    const size_t b = (cursor + i) % n;
+    for (auto it = map.begin(b); it != map.end(b); ++it)
+      if (shouldEvictVoxel(now, it->second->last_seen_t, p) &&
+          !in_use(it->first))
+        stale.push_back(it->first);
   }
-  return evicted;
+  cursor = (cursor + buckets) % n;
+
+  for (const auto& key : stale)
+  {
+    auto it = map.find(key);
+    retire(it->second);
+    map.erase(it);
+  }
+  return static_cast<int>(stale.size());
 }
 
 #endif // MAP_DECAY_POLICY_HPP
