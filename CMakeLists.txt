@@ -32,7 +32,7 @@ find_package(GTSAM REQUIRED QUIET)
 # find_package(Ceres REQUIRED)
 
 # Messages
-file(GLOB MSG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/msg/*.msg)
+file(GLOB MSG_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msg/*.msg)
 foreach(MSG IN ITEMS ${MSG_FILES})
   get_filename_component(MSG_FILENAME ${MSG} NAME)
   set(MSG_FILENAMES ${MSG_FILENAMES} ${MSG_FILENAME})
