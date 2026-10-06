@@ -881,7 +881,7 @@ public:
                 }
 
                 cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld,
-                          sws[0]);
+                          sws[0], x_buf[i].t);
             }
 
             // LidarFactor voxhess(win_size);
@@ -1163,6 +1163,13 @@ public:
     std::string pending_reset_reason_;
 
     DegradeStateTracker degrade_state_tracker_;
+
+    // Voxel map decay (map_decay_policy.hpp; thresholds live in the file-scope
+    // `map_decay`). The sweep cadence is counted in windows rather than
+    // seconds because it is the map's growth that has to be outpaced, and the
+    // map grows once per window.
+    int map_decay_interval_ = 10;
+    long map_voxels_evicted_ = 0;
 
     // Base tuning parameters (used for per-frame scaling; never modified)
     double base_down_size_ = 0.1;
@@ -1568,6 +1575,16 @@ public:
         // 0 keeps every scan, which is what offline reprocessing wants.
         // A real-time deployment should set this; see pcl_handler().
         n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
+        // Voxel map decay, see map_decay_policy.hpp. decay_sec <= 0 disables
+        // eviction; min_obs <= 1 matches against every voxel, which is the
+        // behaviour that predates this.
+        //
+        // The default suits use as a LIO frontend, where surf_map only has to
+        // be the local registration reference for the IEKF and the window BA.
+        // Raise it, or set 0, where the map has to support revisits.
+        n.param<double>("Odometry/map_decay_sec", map_decay.decay_sec, 180.0);
+        n.param<int>("Odometry/map_min_obs", map_decay.min_obs, 1);
+        n.param<int>("Odometry/map_decay_interval", map_decay_interval_, 10);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
         n.param<double>("Initialization/motion_init_min_eigen_value",
@@ -2710,7 +2727,7 @@ public:
             PVec pvec_tem = *(bl->pvec);
             for (pointVar& pv : pvec_tem)
                 pv.pnt = xx.R * pv.pnt + xx.p;
-            cut_voxel(surf_map, pvec_tem, win_size, 0);
+            cut_voxel(surf_map, pvec_tem, win_size, 0, xx.t, false);
         }
 
         PLV(3)
@@ -2721,7 +2738,7 @@ public:
             for (pointVar& pv : *pvec_buf[i])
                 pwld.push_back(x_buf[i].R * pv.pnt + x_buf[i].p);
             cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld,
-                      sws[0]);
+                      sws[0], x_buf[i].t);
         }
 
         for (auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
@@ -2770,7 +2787,7 @@ public:
                     pvec.push_back(pv);
                 }
 
-                cut_voxel(surf_map, pvec, win_size, jour);
+                cut_voxel(surf_map, pvec, win_size, jour, -1.0, true);
                 kf.exist = 0;
                 history_kfsize--;
                 break;
@@ -3212,6 +3229,60 @@ public:
             iter->second->tras_opt(voxopt);
     }
 
+    // Evict voxels of surf_map that no scan has reached for
+    // map_decay.decay_sec of scan time. Returns the number evicted.
+    //
+    // The nodes are queued onto octos_release rather than deleted here: the
+    // recursive OctoTree delete is the expensive half, and
+    // release_pending_octos() already drains that queue under a time budget on
+    // the idle branch. The sweep itself is a pointer walk over the root map.
+    //
+    // Runs on the odometry thread, the only writer of surf_map.
+    int decay_surf_map(double now)
+    {
+        if (map_decay.decay_sec <= 0.0 || now <= 0.0)
+            return 0;
+
+        int evicted = 0;
+        for (auto iter = surf_map.begin(); iter != surf_map.end();)
+        {
+            OctoTree* oc = iter->second;
+            if (!shouldEvictVoxel(now, oc->last_seen_t, oc->decay_exempt, map_decay))
+            {
+                iter++;
+                continue;
+            }
+
+            // A voxel the sliding window still holds must not be freed
+            // underneath the local BA. multi_margi() drops voxels from
+            // surf_map_slide as soon as they stop being observed, so this
+            // only ever spares a voxel that is about to be observed again,
+            // but the cost of checking is one hash lookup.
+            if (surf_map_slide.find(iter->first) != surf_map_slide.end())
+            {
+                iter++;
+                continue;
+            }
+
+            oc->clear_slwd(sws[0]);
+            oc->tras_ptr(octos_release);
+            octos_release.push_back(oc);
+            surf_map.erase(iter++);
+            evicted++;
+        }
+
+        if (evicted > 0)
+        {
+            map_voxels_evicted_ += evicted;
+            ROS_INFO_THROTTLE(30.0,
+                              "voxel map decay: evicted %d voxels (%ld total), "
+                              "%zu remaining, %zu queued for release",
+                              evicted, map_voxels_evicted_, surf_map.size(),
+                              octos_release.size());
+        }
+        return evicted;
+    }
+
     // Free octree nodes that a map teardown has retired. Removing a node from
     // surf_map only queues its children here, so the queue has to be drained
     // somewhere or the map is dropped without its memory being returned.
@@ -3351,26 +3422,12 @@ public:
                 else if (release_flag)
                 {
                     release_flag = false;
-                    vector<OctoTree*> octos;
-                    for (auto iter = surf_map.begin(); iter != surf_map.end();)
-                    {
-                        int dis = jour - iter->second->jour;
-                        if (dis < 700)
-                        // if(dis < 200)
-                        {
-                            iter++;
-                        }
-                        else
-                        {
-                            octos.push_back(iter->second);
-                            iter->second->tras_ptr(octos);
-                            surf_map.erase(iter++);
-                        }
-                    }
-                    int ocsize = octos.size();
-                    for (int i = 0; i < ocsize; i++)
-                        delete octos[i];
-                    octos.clear();
+                    // Eviction itself has moved to the main path
+                    // (decay_surf_map): a thread that keeps up with its input
+                    // never reaches this branch, and that is exactly when the
+                    // map grows fastest. What is still worth doing here is
+                    // handing the freed pages back, which needs the thread to
+                    // be idle.
                     malloc_trim(0);
                 }
                 else if (sws[0].size() > 10000)
@@ -3641,9 +3698,10 @@ public:
                 voxhess.win_size = win_size;
 
                 // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1,
-                // surf_map_slide, win_size, pwld, sws[0]);
+                // surf_map_slide, win_size, pwld, sws[0], x_buf[win_count-1].t);
                 cut_voxel_multi(surf_map, pvec_buf[win_count - 1], win_count - 1,
-                                surf_map_slide, win_size, pwld, sws);
+                                surf_map_slide, win_size, pwld, sws,
+                                x_buf[win_count - 1].t);
                 t2 = ros::Time::now().toSec();
 
                 multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
@@ -3731,6 +3789,16 @@ public:
 
                 multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
                 t6 = ros::Time::now().toSec();
+
+                // Age the persistent map down. Unlike the travelled-distance
+                // rule this replaces, this fires while the vehicle is parked -
+                // a stationary vehicle observing moving objects used to grow the
+                // map without bound because the distance counter never moved.
+                if (map_decay_interval_ > 0 &&
+                    (win_base + win_count) % map_decay_interval_ == 0)
+                {
+                    decay_surf_map(x_curr.t);
+                }
 
                 if ((win_base + win_count) % 10 == 0)
                 {
@@ -4276,7 +4344,7 @@ public:
                             pv.var(j, j) = ap.normal[j];
                         pvec_tem.push_back(pv);
                     }
-                    cut_voxel(map_loop, pvec_tem, win_size, 0);
+                    cut_voxel(map_loop, pvec_tem, win_size, 0, sp.x0.t, false);
                 }
 
                 if (subsize > init_num)
