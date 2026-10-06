@@ -1164,10 +1164,10 @@ public:
 
     DegradeStateTracker degrade_state_tracker_;
 
-    // Voxel map decay (map_decay_policy.hpp; thresholds live in the file-scope
-    // `map_decay`). The sweep cadence is counted in windows rather than
-    // seconds because it is the map's growth that has to be outpaced, and the
-    // map grows once per window.
+    // Voxel map decay (map_decay_policy.hpp). The sweep cadence is counted in
+    // windows rather than seconds because it is the map's growth that has to
+    // be outpaced, and the map grows once per window.
+    MapDecayPolicy map_decay_;
     int map_decay_interval_ = 10;
     long map_voxels_evicted_ = 0;
 
@@ -1576,14 +1576,12 @@ public:
         // A real-time deployment should set this; see pcl_handler().
         n.param<int>("Odometry/max_pcl_buf", max_pcl_buf, 0);
         // Voxel map decay, see map_decay_policy.hpp. decay_sec <= 0 disables
-        // eviction; min_obs <= 1 matches against every voxel, which is the
-        // behaviour that predates this.
+        // eviction.
         //
         // The default suits use as a LIO frontend, where surf_map only has to
         // be the local registration reference for the IEKF and the window BA.
         // Raise it, or set 0, where the map has to support revisits.
-        n.param<double>("Odometry/map_decay_sec", map_decay.decay_sec, 180.0);
-        n.param<int>("Odometry/map_min_obs", map_decay.min_obs, 1);
+        n.param<double>("Odometry/map_decay_sec", map_decay_.decay_sec, 180.0);
         n.param<int>("Odometry/map_decay_interval", map_decay_interval_, 10);
         n.param<double>("Initialization/motion_init_eigen_threshold",
                         motion_init_eig_threshold_, 15.0);
@@ -2727,7 +2725,7 @@ public:
             PVec pvec_tem = *(bl->pvec);
             for (pointVar& pv : pvec_tem)
                 pv.pnt = xx.R * pv.pnt + xx.p;
-            cut_voxel(surf_map, pvec_tem, win_size, 0, xx.t, false);
+            cut_voxel(surf_map, pvec_tem, win_size, 0, xx.t);
         }
 
         PLV(3)
@@ -2787,7 +2785,11 @@ public:
                     pvec.push_back(pv);
                 }
 
-                cut_voxel(surf_map, pvec, win_size, jour, -1.0, true);
+                // Stamped now rather than with the keyframe's own time: the
+                // keyframe is being reloaded because the vehicle is back near
+                // it, which is a revisit, and an old stamp would have the
+                // next sweep evict it straight away.
+                cut_voxel(surf_map, pvec, win_size, jour, x_curr.t);
                 kf.exist = 0;
                 history_kfsize--;
                 break;
@@ -3230,35 +3232,30 @@ public:
     }
 
     // Evict voxels of surf_map that no scan has reached for
-    // map_decay.decay_sec of scan time. Returns the number evicted.
+    // map_decay_.decay_sec of scan time. Returns the number evicted.
     //
     // The nodes are queued onto octos_release rather than deleted here: the
     // recursive OctoTree delete is the expensive half, and
     // release_pending_octos() already drains that queue under a time budget on
-    // the idle branch. The sweep itself is a pointer walk over the root map.
+    // every frame. The sweep itself is a pointer walk over the root map.
+    //
+    // A voxel the sliding window still holds is spared, so it is never freed
+    // underneath the local BA. multi_margi() drops voxels from surf_map_slide
+    // as soon as they stop being observed, so this only ever spares a voxel
+    // that is about to be observed again.
     //
     // Runs on the odometry thread, the only writer of surf_map.
     int decay_surf_map(double now)
     {
-        if (map_decay.decay_sec <= 0.0 || now <= 0.0)
+        if (map_decay_.decay_sec <= 0.0 || now <= 0.0)
             return 0;
 
         int evicted = 0;
         for (auto iter = surf_map.begin(); iter != surf_map.end();)
         {
             OctoTree* oc = iter->second;
-            if (!shouldEvictVoxel(now, oc->last_seen_t, oc->decay_exempt, map_decay))
-            {
-                iter++;
-                continue;
-            }
-
-            // A voxel the sliding window still holds must not be freed
-            // underneath the local BA. multi_margi() drops voxels from
-            // surf_map_slide as soon as they stop being observed, so this
-            // only ever spares a voxel that is about to be observed again,
-            // but the cost of checking is one hash lookup.
-            if (surf_map_slide.find(iter->first) != surf_map_slide.end())
+            if (!shouldEvictVoxel(now, oc->last_seen_t, map_decay_) ||
+                surf_map_slide.find(iter->first) != surf_map_slide.end())
             {
                 iter++;
                 continue;
@@ -4344,7 +4341,7 @@ public:
                             pv.var(j, j) = ap.normal[j];
                         pvec_tem.push_back(pv);
                     }
-                    cut_voxel(map_loop, pvec_tem, win_size, 0, sp.x0.t, false);
+                    cut_voxel(map_loop, pvec_tem, win_size, 0, sp.x0.t);
                 }
 
                 if (subsize > init_num)
