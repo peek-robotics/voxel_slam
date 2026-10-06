@@ -347,3 +347,36 @@ TEST(OdomPublishPolicy, DirectionalWriteLeavesTheOrientationBlockAlone)
     for (int j = 3; j < 6; ++j)
       EXPECT_EQ(cov[i * 6 + j], 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// One-sided degeneracy gate
+// ---------------------------------------------------------------------------
+
+TEST(OdomPublishPolicy, CorridorScanIsOneSided)
+{
+  // Two walls and the ground: strong across the corridor and vertically, blind
+  // along it. This is the case the directional regime exists for.
+  EXPECT_TRUE(isOneSidedDegeneracy(Eigen::Vector3d(0.5, 300.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, GroundOnlyScanIsNotOneSided)
+{
+  // Open flat ground: only the ground plane, so both horizontal directions are
+  // unobserved. The weakest/strongest ratio is ~0 and alone would pass, but
+  // the weakest eigenvector is then an arbitrary horizontal axis and the
+  // other one - just as blind - would be published as well known.
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d(0.5, 2.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, UniformlyWeakScanIsNotOneSided)
+{
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d(400.0, 600.0, 1000.0), 0.1));
+}
+
+TEST(OdomPublishPolicy, OneSidedGateIsOffByDefaultAndOnEmptyInput)
+{
+  const Eigen::Vector3d corridor(0.5, 300.0, 1000.0);
+  EXPECT_FALSE(isOneSidedDegeneracy(corridor, 0.0));
+  EXPECT_FALSE(isOneSidedDegeneracy(corridor, -1.0));
+  EXPECT_FALSE(isOneSidedDegeneracy(Eigen::Vector3d::Zero(), 0.1));
+}

@@ -165,6 +165,28 @@ inline void applyOdomCovariance(Cov &cov, double absolute_linear,
 // A zero-length `dir` is treated as "no direction known" and yields the
 // isotropic `constrained * I`, which is the safe reading of an absent input
 // rather than a division by zero.
+// Whether the scan's translational information is weak in exactly one
+// direction, so that the weakest eigenvector names a direction worth
+// publishing. `evalues` are the eigenvalues of the plane-normal matrix in
+// ascending order.
+//
+// The weakest/strongest ratio alone is not enough. With only the ground in
+// view the eigenvalues are ~[0, 0, N]: that ratio is ~0, but the weakest
+// eigenvector is then an arbitrary horizontal axis, and the other horizontal
+// axis - equally unobserved - would be published at the constrained variance.
+// So the middle eigenvalue must clear the same threshold the weakest falls
+// under.
+//
+// `max_ratio` <= 0 disables the directional regime.
+inline bool isOneSidedDegeneracy(const Eigen::Vector3d &evalues,
+                                 double max_ratio)
+{
+  if (max_ratio <= 0.0 || !(evalues[2] > 1e-9))
+    return false;
+  return evalues[0] / evalues[2] <= max_ratio &&
+         evalues[1] / evalues[2] > max_ratio;
+}
+
 template <typename Cov>
 inline void applyDirectionalPositionCovariance(Cov &cov,
                                                const Eigen::Vector3d &dir,
