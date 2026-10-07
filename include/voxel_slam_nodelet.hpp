@@ -16,6 +16,8 @@ private:
 
 	ros::NodeHandle nh_;
 	ros::NodeHandle pnh_;
+	// True once voxel_slam_start() returned: only then do detached threads exist.
+	bool started_ = false;
 };
 
 } // namespace voxel_slam

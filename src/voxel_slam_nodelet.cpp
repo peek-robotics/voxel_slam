@@ -23,6 +23,7 @@ void VoxelSlamNodelet::onInit() {
 
 		// Start Voxel-SLAM core (spawns its own threads and publishers)
 		voxel_slam_start(pnh_);
+		started_ = true;
 
 	NODELET_INFO("voxel_slam nodelet initialized");
 }
@@ -34,7 +35,9 @@ void VoxelSlamNodelet::onInit() {
 // instead: it respawns, and every nodelet reloads into a clean process. When
 // the manager itself is shutting down, the threads die with it as before.
 VoxelSlamNodelet::~VoxelSlamNodelet() {
-	if (!ros::ok() || ros::isShuttingDown())
+	// A constructor that threw (e.g. bad lidar_type) started no threads, so a
+	// plain unload is safe and the manager must not be taken down.
+	if (!started_ || !ros::ok() || ros::isShuttingDown())
 		return;
 
 	NODELET_FATAL("voxel_slam cannot be unloaded from a running manager; "
