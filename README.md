@@ -12,6 +12,9 @@
 - Merged [LTU-RAI's mods](https://github.com/LTU-RAI/voxel_slam).
 - Per-section timing through the shared `grover_profiling` harness (`GPROF_*`),
   with an opt-in periodic report (see below).
+- Runtime diagnostics on `~lio_diag` as `grover_msgs/LIODiag` (was `voxel_slam/LIODiag`).
+  Grover's launch remaps it, `~local_accumulated` and `~map_scan_full` to
+  `/lidar_3d/lio/*`, the same names `rko_lio` publishes.
 
 ### Added features are purely for our use cases and are not guaranteed to work with all existing features
 
