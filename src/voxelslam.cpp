@@ -1129,6 +1129,9 @@ public:
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
+    bool keep_last_z_ = true;           // reset keeps the last estimated z over the TF's
+    bool have_last_good_z_ = false;
+    double last_good_z_ = 0.0;
 
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
@@ -1573,6 +1576,7 @@ public:
                         reset_attempt_policy_.escalate_growth, 2.0);
         n.param<double>("Reset/max_escalate_sec",
                         reset_attempt_policy_.max_escalate_s, 60.0);
+        n.param<bool>("Reset/keep_last_z", keep_last_z_, true);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         // 0 keeps every scan, which is what offline reprocessing wants.
@@ -3016,13 +3020,18 @@ public:
             }
             else if (seeded == SeedOutcome::Accepted)
             {
+                // The 2D EKF's TF z is just the mount height; keep ours.
+                const bool keep_z = keep_last_z_ && have_last_good_z_;
+                if (keep_z)
+                    x_curr.p.z() = last_good_z_;
                 initialized_from_tf = true;
                 g_has_anchor = true;
                 g_pose_source = PoseSource::External;
                 markPoseDiscontinuity();
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
-                                               << " using x/y/z/yaw: p=["
-                                               << x_curr.p.transpose() << "]");
+                                               << " using x/y/yaw, z from "
+                                               << (keep_z ? "last estimate" : "TF")
+                                               << ": p=[" << x_curr.p.transpose() << "]");
             }
             else
             {
@@ -3621,6 +3630,11 @@ public:
 
                 // Run state estimation
                 estimation_success = GPROF_CALL("lio", lio_state_estimation(pptr));
+                if (estimation_success)
+                {
+                    have_last_good_z_ = true;
+                    last_good_z_ = x_curr.p.z();
+                }
 
                 // Motion Stability Check (Phase 1 Degeneration Improvement)
                 // Compute rotation magnitude from last frame to detect rapid rotations
