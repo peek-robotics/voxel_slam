@@ -3603,11 +3603,16 @@ public:
                 }
 
                 const uint8_t active_state_pre = std::min<uint8_t>(static_cast<uint8_t>(active_degrade_state_pre), static_cast<uint8_t>(DegradeState::High));
-                const int down_size_div = static_cast<int>(active_state_pre);
-                const double effective_down_size = base_down_size_ / static_cast<double>(down_size_div);
-                const double err_scale = std::sqrt(static_cast<double>(active_state_pre));
-                const double effective_dept_err = base_dept_err_; // * err_scale;
-                const double effective_beam_err = base_beam_err_; // * err_scale;
+                // Degrade state no longer scales the downsample resolution. Making
+                // the cloud finer in low-observability zones (orchard foliage)
+                // exploded the point count -> recut/BA/map cost blew the frame
+                // budget and the fine, non-planar points never restored
+                // observability, so the state latched at High. Downsample always
+                // at the configured base size; the IMU trust below still stiffens
+                // with degradation, which is the useful part of the response.
+                const double effective_down_size = base_down_size_;
+                const double effective_dept_err = base_dept_err_;
+                const double effective_beam_err = base_beam_err_;
                 imu_coef = base_imu_coef_ * static_cast<double>(active_state_pre);
 
                 {
