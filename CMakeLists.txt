@@ -25,6 +25,7 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   livox_ros_driver2
   grover_profiling
+  grover_msgs
 )
 
 find_package(Eigen3 REQUIRED)
@@ -32,27 +33,10 @@ find_package(PCL REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
 # find_package(Ceres REQUIRED)
 
-# Messages
-file(GLOB MSG_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msg/*.msg)
-foreach(MSG IN ITEMS ${MSG_FILES})
-  get_filename_component(MSG_FILENAME ${MSG} NAME)
-  set(MSG_FILENAMES ${MSG_FILENAMES} ${MSG_FILENAME})
-endforeach()
-
-add_message_files(
-  DIRECTORY msg
-  FILES ${MSG_FILENAMES}
-)
-
-generate_messages(
-  DEPENDENCIES
-    std_msgs
-)
-
 # Catkin package
 catkin_package(
   CATKIN_DEPENDS geometry_msgs nodelet nav_msgs roscpp rospy std_msgs std_srvs
-                 grover_profiling
+                 grover_profiling grover_msgs
   DEPENDS EIGEN3 PCL GTSAM
   INCLUDE_DIRS
   LIBRARIES ${PROJECT_NAME}
@@ -82,7 +66,7 @@ target_link_libraries(${PROJECT_NAME}
   gtsam
 )
 
-add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
+add_dependencies(${PROJECT_NAME} ${catkin_EXPORTED_TARGETS})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   include
@@ -97,7 +81,7 @@ add_library(${PROJECT_NAME}_nodelet
 )
 
 target_link_libraries(${PROJECT_NAME}_nodelet ${PROJECT_NAME})
-add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
+add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME} ${catkin_EXPORTED_TARGETS})
 
 if(CATKIN_ENABLE_TESTING)
   # The headers under test (velocity_update.hpp, reset_attempt_policy.hpp, ...)
