@@ -52,6 +52,33 @@ double g_uncertain_variance = 1e3;
 double g_discontinuity_orientation_variance = -1.0;
 double g_uncertain_orientation_variance = -1.0;
 
+// Weakest-constrained translation direction of the last LiDAR update, in the
+// odom frame, and the observability ratio that says whether calling it a
+// "direction" is meaningful at all.
+//
+// The point-to-plane Jacobian with respect to translation is the plane normal,
+// so the n*n^T accumulated in lio_state_estimation() is exactly the
+// translational information of the scan. Its weakest eigenvector is the
+// direction the LiDAR cannot resolve - in a corridor, along it. The
+// eigenvectors were already being computed and discarded; only the two scalar
+// summaries were kept.
+//
+// Written and read on the odometry thread only, like g_is_initializing and
+// g_pose_source.
+Eigen::Vector3d g_degenerate_dir = Eigen::Vector3d::Zero();
+bool g_degenerate_dir_valid = false;
+// Ascending eigenvalues of that matrix. Kept whole because a direction is only
+// meaningful when exactly one of them is small - see isOneSidedDegeneracy().
+Eigen::Vector3d g_degenerate_evalues = Eigen::Vector3d::Zero();
+// The degraded covariance is answered directionally only when the weakest
+// eigenvalue is below this fraction of the strongest and the middle one is
+// not. Otherwise the scan is weak in more than one direction, and one number
+// is then the honest answer. <= 0 disables the directional regime.
+double g_directional_observability_max = 0.0;
+// Variance published along the two directions the LiDAR *can* see while
+// degraded. <= 0 keeps the isotropic replacement. See OdomPublishPolicy.
+double g_uncertain_constrained_variance = -1.0;
+
 // Called at every point that moves the pose other than by integration.
 inline void markPoseDiscontinuity() { g_frames_since_discontinuity = 0; }
 // Zero published forward body-frame twist when |linear.x| falls below this threshold.
@@ -209,18 +236,36 @@ public:
         const DegradeState degrade_state =
                 g_degrade_state_tracker ? g_degrade_state_tracker->current()
                                         : DegradeState::Ok;
+        // A degeneracy is worth answering directionally only when it is
+        // actually one-sided. The gate keeps a uniformly weak scan, a scan
+        // weak in two directions, and a degrade state reached through the
+        // wheel watchdog rather than through LiDAR geometry, on the isotropic
+        // path.
+        const bool degeneracy_is_directional =
+                g_degenerate_dir_valid &&
+                isOneSidedDegeneracy(g_degenerate_evalues,
+                                     g_directional_observability_max);
+
         const OdomPublishPolicy policy = decideOdomPublish(
                 g_has_anchor, g_is_initializing, degrade_state,
                 g_frames_since_discontinuity, g_discontinuity_frames,
                 g_discontinuity_variance, g_uncertain_variance,
                 g_discontinuity_orientation_variance,
-                g_uncertain_orientation_variance);
+                g_uncertain_orientation_variance, degeneracy_is_directional,
+                g_uncertain_constrained_variance);
         if (!policy.publish)
             return;
         applyOdomCovariance(odom_msg.pose.covariance,
                             policy.pose_position_absolute,
                             policy.pose_orientation_absolute, policy.pose_scale,
                             policy.zero_off_diagonal);
+        // Overwrites the position block the pass above only zeroed the
+        // off-diagonals of, so it must come second.
+        if (policy.pose_position_directional > 0.0)
+            applyDirectionalPositionCovariance(odom_msg.pose.covariance,
+                                               g_degenerate_dir,
+                                               policy.pose_position_constrained,
+                                               policy.pose_position_directional);
         applyOdomCovariance(odom_msg.twist.covariance, policy.twist_absolute,
                             policy.twist_absolute, policy.twist_scale,
                             policy.zero_off_diagonal);
@@ -1361,7 +1406,10 @@ public:
     // Metrics we already compute (exposed via diagnostics)
     int last_match_count_ = 0;
     float last_normal_eigenvalue_min_ = 0.0f;
+    float last_normal_eigenvalue_max_ = 0.0f;
     float last_normal_observability_ = 0.0f;
+    Eigen::Vector3d last_degenerate_dir_ = Eigen::Vector3d::Zero();
+    bool last_degeneracy_valid_ = false;
 
     vector<string> sessionNames;
     string bagname, savepath;
@@ -1550,6 +1598,13 @@ public:
                         g_discontinuity_orientation_variance, -1.0);
         n.param<double>("Odometry/uncertain_orientation_variance",
                         g_uncertain_orientation_variance, -1.0);
+        // Directional degraded covariance. Off by default: it changes what the
+        // downstream filter is told during degraded operation, which wants
+        // validating against a recorded traverse before it is switched on.
+        n.param<double>("Odometry/directional_observability_max",
+                        g_directional_observability_max, 0.0);
+        n.param<double>("Odometry/uncertain_constrained_variance",
+                        g_uncertain_constrained_variance, -1.0);
         n.param<bool>("Reset/level_from_gravity", level_from_gravity_, true);
         n.param<double>("Reset/level_window_sec", level_window_sec_, 1.0);
         n.param<double>("Reset/datum_max_age_sec", datum_max_age_s_, 120.0);
@@ -2046,7 +2101,12 @@ public:
         msg.point_cloud_size = point_cloud_size;
         msg.match_count = last_match_count_;
         msg.normal_eigenvalue_min = last_normal_eigenvalue_min_;
+        msg.normal_eigenvalue_max = last_normal_eigenvalue_max_;
         msg.normal_observability = last_normal_observability_;
+        msg.degeneracy_direction_valid = last_degeneracy_valid_;
+        for (int i = 0; i < 3; i++)
+            msg.degenerate_direction[i] =
+                    static_cast<float>(last_degenerate_dir_[i]);
 
         msg.wheel_odom_violation_count = wheel_odom_violation_count_;
         msg.wheel_odom_diff = last_wheel_odom_diff_;
@@ -2254,7 +2314,22 @@ public:
 
         last_match_count_ = match_num;
         last_normal_eigenvalue_min_ = static_cast<float>(evalue[0]);
+        last_normal_eigenvalue_max_ = static_cast<float>(evalue[2]);
         last_normal_observability_ = (evalue[2] > 1e-9) ? static_cast<float>(evalue[0] / evalue[2]) : 0.0f;
+
+        // SelfAdjointEigenSolver computes the eigenvectors as well by default,
+        // so this direction has already been paid for; it used to be discarded
+        // and only the two scalars above kept.
+        //
+        // Eigenvalues come out ascending, so column 0 is the direction with the
+        // least plane-normal support - the one this scan does not constrain.
+        // The normals are map-frame, so it needs no rotating to line up with
+        // the odometry message's frame.
+        last_degenerate_dir_ = saes.eigenvectors().col(0);
+        last_degeneracy_valid_ = (match_num > 0 && evalue[2] > 1e-9);
+        g_degenerate_dir = last_degenerate_dir_;
+        g_degenerate_dir_valid = last_degeneracy_valid_;
+        g_degenerate_evalues = evalue;
 
         // Wheel-velocity IEKF update: anchors the LIO body-X velocity to the
         // wheel odom after the lidar IEKF has converged. This backstops the
