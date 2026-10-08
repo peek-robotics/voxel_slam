@@ -3459,6 +3459,10 @@ public:
                 continue;
             }
 
+            // One scan, from its pop to the end of its publishing: the root the
+            // [prof voxel_slam] report breaks the sections below down against.
+            GPROF_SCOPE("frame");
+
             // The first batch after a stamp step: reset onto the new time base
             // before anything integrates across it. pl_epoch is the epoch this
             // batch was checked against, not the current one, so a step
@@ -3916,8 +3920,8 @@ public:
             // emitted by the reporter at report time. This also keeps the
             // process-memory read off the per-frame path - the reporter
             // refreshes it once per report, not once per scan.
-            GPROF_GAUGE("voxel_map_size", static_cast<double>(surf_map.size()));
-            GPROF_GAUGE("sws_pool", static_cast<double>(sws[0].size()));
+            GPROF_GAUGE("map", static_cast<double>(surf_map.size()));
+            GPROF_GAUGE("sws", static_cast<double>(sws[0].size()));
 
             pub_diagnostics(odom_ekf.pcl_end_time,
                             estimation_success,
@@ -4881,26 +4885,24 @@ public:
     {
         double report_hz = 1.0;
         n.param<double>("Profiling/report_hz", report_hz, 1.0);
-        if (report_hz <= 0.0)
-            report_hz = 1.0;
-        const std::chrono::duration<double> period(1.0 / report_hz);
+        grover_profile::FormatOptions prof;
+        prof.tag = "voxel_slam";
+        prof.period_s = 1.0 / (report_hz > 0.0 ? report_hz : 1.0);
+        // <= 0 derives the per-frame budget from the frame rate.
+        n.param<double>("Profiling/budget_ms", prof.budget_ms, 0.0);
+        const std::chrono::duration<double> period(prof.period_s);
 
         while (n.ok())
         {
             std::this_thread::sleep_for(period);
 
-            double pcl_queue = 0.0;
-            double pcl_dropped_now = 0.0;
             mBuf.lock();
-            pcl_queue = static_cast<double>(pcl_buf.size());
-            pcl_dropped_now = static_cast<double>(pcl_dropped);
+            const double pcl_queue = static_cast<double>(pcl_buf.size());
+            const double pcl_dropped_now = static_cast<double>(pcl_dropped);
             mBuf.unlock();
-            GPROF_GAUGE("pcl_queue", pcl_queue);
-            GPROF_GAUGE("pcl_dropped", pcl_dropped_now);
-
-            // take_report_line() refreshes the process-memory gauges, consumes
-            // the section window, and formats the tagged, colour-coded block.
-            ROS_INFO("%s", grover_profile::take_report_line().c_str());
+            GPROF_GAUGE("q", pcl_queue);
+            GPROF_GAUGE("drop", pcl_dropped_now);
+            ROS_INFO("%s", grover_profile::take_report_line(prof).c_str());
         }
     }
 };

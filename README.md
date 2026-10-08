@@ -23,21 +23,24 @@
 Section timings are recorded with the header-only `grover_profiling` harness
 (`GPROF_SCOPE` / `GPROF_CALL` / `GPROF_GAUGE`). The measurement is always
 compiled in and off unless `Profiling/enable` is set; when enabled a reporter
-thread emits a tagged, colour-coded block every `1/report_hz` seconds —
-sections slowest-first with avg/max ms and counts, plus process RSS/VM, the
-voxel map size and the input-queue depth (the same block the backend prints):
+thread emits a `[prof voxel_slam]` tree every `1/report_hz` seconds: the
+`frame` section (one scan, pop to publish) with its rate and share of its
+budget, the sections nested under it with their share of the frame, then the
+other threads' sections, plus process RSS, the voxel map size and the
+input-queue depth (the same form the backend prints):
 
 ```
-[prof] rss 379.9 MB | vm 1724.9 MB | peak 379.9 MB | voxel_map_size 12075.0
-       local_ba            8.8 /   27.0 ms  n=287
-       recut               8.9 /   19.3 ms  n=287
-       ...
+[prof voxel_slam]  frame 31.2 / 58.0 ms  n=50  10.0 Hz  31% of 100 ms   rss 380 MB | drop 0 | map 12075 | q 0 | sws 3120
+  |- local_ba             8.8 / 27.0    28% ###
+  |- recut                8.9 / 19.3    28% ###
+  ...
 ```
 
 ```
 Profiling:
   enable: true       # emit the periodic report
   report_hz: 0.2     # every 5 s
+  budget_ms: 0       # frame budget; <= 0 = 1000 / frame rate
 ```
 
 The old per-frame `t0..t6` scratch timers and the commented-out timing `printf`
