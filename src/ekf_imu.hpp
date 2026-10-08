@@ -3,6 +3,7 @@
 
 #include "tools.hpp"
 #include <deque>
+#include <ros/console.h>
 #include <sensor_msgs/Imu.h>
 
 class IMUEKF
@@ -38,15 +39,18 @@ public:
     angvel_last.setZero(); acc_s_last.setZero();
   }
 
-  void motion_blur(IMUST &xc, pcl::PointCloud<PointType> &pcl_in, deque<sensor_msgs::Imu::Ptr> &imus)
+  // Returns false if the scan was dropped; the state is then untouched.
+  bool motion_blur(IMUST &xc, pcl::PointCloud<PointType> &pcl_in, deque<sensor_msgs::Imu::Ptr> &imus)
   {
-    imus.push_front(last_imu);
-
     if(last_pcl_end_time - pcl_beg_time > 0.1)
     {
-      printf("%lf %lf\n", pcl_beg_time, last_pcl_end_time);
-      printf("LiDAR time regress. Please check data\n"); exit(0);
+      // Was exit(0), which killed the whole nodelet manager: drop the scan instead.
+      ROS_ERROR_THROTTLE(1.0, "LiDAR time regress: scan begins %lf, previous ended %lf; dropping the scan",
+                         pcl_beg_time, last_pcl_end_time);
+      return false;
     }
+
+    imus.push_front(last_imu);
 
     imu_poses.clear();
     // imu_poses.emplace_back(0, xc.R, xc.p, xc.v, angvel_last, acc_s_last);
@@ -133,7 +137,7 @@ public:
     imus.back()  = imu2;
 
     if(point_notime)
-      return;
+      return true;
 
     auto it_pcl = pcl_in.end() - 1;
     for(int i=imu_poses.size()-1; i>=0; i--)
@@ -162,6 +166,7 @@ public:
       }
     }
 
+    return true;
   }
 
   void IMU_init(deque<sensor_msgs::Imu::Ptr> &imus)
@@ -209,8 +214,7 @@ public:
       return 0;
     }
 
-    motion_blur(x_curr, pcl_in, imus);
-    return 1;
+    return motion_blur(x_curr, pcl_in, imus) ? 1 : 0; // 0: scan dropped, callers skip it
   }
 
 };

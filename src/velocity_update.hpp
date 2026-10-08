@@ -39,6 +39,14 @@ inline Eigen::Matrix<double, 1, DIM> bodyVelocityJacobian(
   return H;
 }
 
+// rot_wheel_from_base is lookupTransform(wheel_frame, base_link), which maps
+// base_link vectors into the wheel frame; a wheel velocity needs its inverse.
+inline Eigen::Vector3d wheelVelocityInBase(const Eigen::Matrix3d &rot_wheel_from_base,
+                                           const Eigen::Vector3d &v_wheel)
+{
+  return rot_wheel_from_base.transpose() * v_wheel;
+}
+
 // axis: 0 = body x, 1 = body y. z is the measured component, meas_var its
 // variance (already clamped by the caller), weight >= 1 the degeneracy gain
 // boost; the effective measurement variance is meas_var / weight. The

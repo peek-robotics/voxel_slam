@@ -9,9 +9,41 @@
 - Disableable tf pub
 - Ability to start and recover from current odom
 - Added alternate odom source input as a sanity check reset (avoid runaways in corridors)
-- Merged [LTU-RAI's mods](https://github.com/LTU-RAI/Voxel-SLAM).
+- Merged [LTU-RAI's mods](https://github.com/LTU-RAI/voxel_slam).
+- Per-section timing through the shared `grover_profiling` harness (`GPROF_*`),
+  with an opt-in periodic report (see below).
+- Runtime diagnostics on `~lio_diag` as `grover_msgs/LIODiag` (was `voxel_slam/LIODiag`).
 
 ### Added features are purely for our use cases and are not guaranteed to work with all existing features
+
+## Profiling
+
+Section timings are recorded with the header-only `grover_profiling` harness
+(`GPROF_SCOPE` / `GPROF_CALL` / `GPROF_GAUGE`). The measurement is always
+compiled in and off unless `Profiling/enable` is set; when enabled a reporter
+thread emits a `[prof voxel_slam]` tree every `1/report_hz` seconds: the
+`frame` section (one scan, pop to publish) with its rate and share of its
+budget, the sections nested under it with their share of the frame, then the
+other threads' sections, plus process RSS, the voxel map size and the
+input-queue depth:
+
+```
+[prof voxel_slam]  frame 31.2 / 58.0 ms  n=50  10.0 Hz  31% of 100 ms   rss 380 MB | drop 0 | map 12075 | q 0 | sws 3120
+  |- local_ba             8.8 / 27.0    28% ###
+  |- recut                8.9 / 19.3    28% ###
+  ...
+```
+
+```
+Profiling:
+  enable: true       # emit the periodic report
+  report_hz: 0.2     # every 5 s
+  budget_ms: 0       # frame budget; <= 0 = 1000 / frame rate
+```
+
+The old per-frame `t0..t6` scratch timers and the commented-out timing `printf`
+are gone; `LIODiag.processing_time_ms` is unchanged (now measured on a
+monotonic clock).
 
 ## 1. Introduction
 

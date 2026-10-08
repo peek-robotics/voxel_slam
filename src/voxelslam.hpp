@@ -306,12 +306,16 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
     imus.push_back(imu_buf.front());
     imu_buf.pop_front();
   }
-  mBuf.unlock();
-
   if (imu_buf.empty()) {
-    printf("imu buf empty\n");
-    exit(0);
+    // Was exit(0), killing the manager: drop the scan, hand its IMU back so the stream stays contiguous.
+    imu_buf.insert(imu_buf.begin(), imus.begin(), imus.end());
+    imus.clear();
+    mBuf.unlock();
+    pl_ready = false;
+    ROS_ERROR_THROTTLE(1.0, "[voxel_slam] IMU buffer empty after taking a scan's IMU; dropping the scan");
+    return false;
   }
+  mBuf.unlock();
 
   pl_ready = false;
 
@@ -413,29 +417,6 @@ void read_lidarstate(string filename, vector<ScanPose *> &bl_tem) {
       for (int i = 0; i < 6; i++)
         blp->v6[i] = nums[i + 20];
   }
-}
-
-double get_memory() {
-  ifstream infile("/proc/self/status");
-  double mem = -1;
-  string lineStr, str;
-  while (getline(infile, lineStr)) {
-    stringstream ss(lineStr);
-    bool is_find = false;
-    while (ss >> str) {
-      if (str == "VmRSS:") {
-        is_find = true;
-        continue;
-      }
-
-      if (is_find)
-        mem = stod(str);
-      break;
-    }
-    if (is_find)
-      break;
-  }
-  return mem / (1048576);
 }
 
 void icp_check(pcl::PointCloud<PointType> &pl_src,
