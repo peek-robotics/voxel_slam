@@ -306,12 +306,16 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr,
     imus.push_back(imu_buf.front());
     imu_buf.pop_front();
   }
-  mBuf.unlock();
-
   if (imu_buf.empty()) {
-    printf("imu buf empty\n");
-    exit(0);
+    // Was exit(0), killing the manager: drop the scan, hand its IMU back so the stream stays contiguous.
+    imu_buf.insert(imu_buf.begin(), imus.begin(), imus.end());
+    imus.clear();
+    mBuf.unlock();
+    pl_ready = false;
+    ROS_ERROR_THROTTLE(1.0, "[voxel_slam] IMU buffer empty after taking a scan's IMU; dropping the scan");
+    return false;
   }
+  mBuf.unlock();
 
   pl_ready = false;
 
