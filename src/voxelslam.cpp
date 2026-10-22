@@ -18,7 +18,7 @@
 #include <thread>
 #include <tf/transform_listener.h>
 
-#include <voxel_slam/LIODiag.h>
+#include <grover_msgs/LIODiag.h>
 
 #include <grover_profiling/profiling.hpp>
 
@@ -1620,7 +1620,7 @@ public:
         odom_ekf.point_notime = point_notime;
 
         // Diagnostics publisher
-        pub_diag_ = n.advertise<voxel_slam::LIODiag>("lio_diag", 10);
+        pub_diag_ = n.advertise<grover_msgs::LIODiag>("lio_diag", 10);
 
         feat.blind = feat.blind * feat.blind;
         odom_ekf.cov_gyr << cov_gyr, cov_gyr, cov_gyr;
@@ -2014,29 +2014,29 @@ public:
 
         (void)slam_vx_body;
 
-        voxel_slam::LIODiag msg;
+        grover_msgs::LIODiag msg;
         msg.header.stamp = (stamp > 0.0) ? ros::Time(stamp) : ros::Time::now();
         static_assert(static_cast<uint8_t>(PoseSource::None) ==
-                              voxel_slam::LIODiag::POSE_SOURCE_NONE &&
+                              grover_msgs::LIODiag::POSE_SOURCE_NONE &&
                       static_cast<uint8_t>(PoseSource::Estimate) ==
-                              voxel_slam::LIODiag::POSE_SOURCE_ESTIMATE &&
+                              grover_msgs::LIODiag::POSE_SOURCE_ESTIMATE &&
                       static_cast<uint8_t>(PoseSource::External) ==
-                              voxel_slam::LIODiag::POSE_SOURCE_EXTERNAL,
+                              grover_msgs::LIODiag::POSE_SOURCE_EXTERNAL,
                       "PoseSource must match the LIODiag constants");
         msg.pose_source = static_cast<uint8_t>(g_pose_source);
-        static_assert(static_cast<uint8_t>(SeedStatus::None) == voxel_slam::LIODiag::SEED_NONE &&
+        static_assert(static_cast<uint8_t>(SeedStatus::None) == grover_msgs::LIODiag::SEED_NONE &&
                               static_cast<uint8_t>(SeedStatus::Accepted) ==
-                                      voxel_slam::LIODiag::SEED_ACCEPTED &&
+                                      grover_msgs::LIODiag::SEED_ACCEPTED &&
                               static_cast<uint8_t>(SeedStatus::RejectedNonFinite) ==
-                                      voxel_slam::LIODiag::SEED_REJECTED_NONFINITE &&
+                                      grover_msgs::LIODiag::SEED_REJECTED_NONFINITE &&
                               static_cast<uint8_t>(SeedStatus::RejectedRadius) ==
-                                      voxel_slam::LIODiag::SEED_REJECTED_RADIUS &&
+                                      grover_msgs::LIODiag::SEED_REJECTED_RADIUS &&
                               static_cast<uint8_t>(SeedStatus::RejectedJump) ==
-                                      voxel_slam::LIODiag::SEED_REJECTED_JUMP &&
+                                      grover_msgs::LIODiag::SEED_REJECTED_JUMP &&
                               static_cast<uint8_t>(SeedStatus::FallbackTrusted) ==
-                                      voxel_slam::LIODiag::SEED_FALLBACK_TRUSTED &&
+                                      grover_msgs::LIODiag::SEED_FALLBACK_TRUSTED &&
                               static_cast<uint8_t>(SeedStatus::Withheld) ==
-                                      voxel_slam::LIODiag::SEED_WITHHELD,
+                                      grover_msgs::LIODiag::SEED_WITHHELD,
                       "SeedStatus must match the LIODiag constants");
         msg.seed_status = static_cast<uint8_t>(last_seed_status_);
         msg.seed_rejection = static_cast<uint8_t>(last_seed_rejection_);
@@ -2088,6 +2088,11 @@ public:
         // msg.cov_inflation_rot[0] = msg.cov_inflation_rot[1] = msg.cov_inflation_rot[2] = 0.0f;
 
         msg.processing_time_ms = static_cast<float>(processing_time_ms);
+
+        {
+            lock_guard<mutex> lock(mBuf);
+            msg.pcl_dropped = static_cast<uint32_t>(pcl_dropped);
+        }
 
         pub_diag_.publish(msg);
     }
