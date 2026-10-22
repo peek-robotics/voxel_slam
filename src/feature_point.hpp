@@ -172,9 +172,9 @@ public:
             generic_xyzi_handler(msg, pl_full);
             break;
 
-        default:
-            printf("Lidar Type Error\n");
-            exit(0);
+        default: // unreachable: the constructor rejects an unknown lidar_type
+            ROS_ERROR_THROTTLE(1.0, "Lidar type %d is not supported", lidar_type);
+            break;
         }
 
         return t0;
@@ -436,6 +436,8 @@ public:
 
         pl_surf.clear();
         int plsize = pl_orig.points.size();
+        if (plsize == 0) // points[0] below is UB on an empty message
+            return;
         pl_surf.reserve(plsize);
 
         double time_head = pl_orig.points[0].timestamp;
@@ -457,7 +459,8 @@ public:
 
             const double r2 = added_pt.x * added_pt.x +
                               added_pt.y * added_pt.y + added_pt.z * added_pt.z;
-            if (r2 > blind * blind && pass_decimation(i, r2))
+            // blind is already squared at load, as every other handler assumes
+            if (r2 > blind && pass_decimation(i, r2))
             {
                 pl_surf.points.push_back(added_pt);
             }

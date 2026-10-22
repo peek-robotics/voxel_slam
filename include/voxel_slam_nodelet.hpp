@@ -9,13 +9,15 @@ namespace voxel_slam {
 class VoxelSlamNodelet final : public nodelet::Nodelet {
 public:
 	VoxelSlamNodelet() = default;
-	~VoxelSlamNodelet() override = default;
+	~VoxelSlamNodelet() override;
 
 private:
 	void onInit() override;
 
 	ros::NodeHandle nh_;
 	ros::NodeHandle pnh_;
+	// True once voxel_slam_start() returned: only then do detached threads exist.
+	bool started_ = false;
 };
 
 } // namespace voxel_slam

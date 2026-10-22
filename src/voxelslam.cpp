@@ -13,6 +13,7 @@
 #include <memory>
 #include <pcl/common/transforms.h>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tf/transform_listener.h>
@@ -388,7 +389,7 @@ public:
                 if (pl.size() > interval_size)
                 {
                     pub_pl_func(pl, pub);
-                    sleep(0.05);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // sleep(unsigned) truncated to 0
                     pl.clear();
                 }
             }
@@ -1120,6 +1121,9 @@ public:
     SeedStatus last_seed_status_ = SeedStatus::None;
     SeedStatus last_seed_rejection_ = SeedStatus::None;
     bool seed_withheld_ = false;
+    // While a seed is withheld it is re-attempted at most this often (Reset/seed_retry_sec).
+    double seed_retry_sec_ = 1.0;
+    std::chrono::steady_clock::time_point last_seed_retry_ = std::chrono::steady_clock::now();
 
     // Stamp steps already acted on (see stamp_guard.hpp), and how many.
     uint64_t stamp_epoch_handled_ = 0;
@@ -1129,6 +1133,9 @@ public:
     Eigen::Matrix3d datum_correction_ = Eigen::Matrix3d::Identity();
     double datum_stamp_ = -1.0;
     double datum_gravity_norm_ = G_m_s2;
+    bool keep_last_z_ = true;           // reset keeps the last estimated z over the TF's
+    bool have_last_good_z_ = false;
+    double last_good_z_ = 0.0;
 
     double wheel_velocity_nis_max_ = 25.0;          // innovation test, chi-square with 1 dof; <=0 disables
     int wheel_velocity_gated_count_ = 0;
@@ -1465,6 +1472,12 @@ public:
         n.param<string>("General/bagname", bagname, "site3_handheld_4");
         n.param<string>("General/save_path", savepath, "");
         n.param<int>("General/lidar_type", feat.lidar_type, 0);
+        // Fail the load visibly rather than exit(0) the whole manager on the first scan.
+        if (feat.lidar_type < LIVOX || feat.lidar_type > GENERIC_XYZI)
+        {
+            ROS_FATAL("General/lidar_type %d is not supported (0-7)", feat.lidar_type);
+            throw std::invalid_argument("voxel_slam: unsupported General/lidar_type");
+        }
         n.param<double>("General/blind", feat.blind, 0.1);
         n.param<int>("General/point_filter_num", feat.point_filter_num, 3);
         // Range (m) beyond which points are always kept regardless of
@@ -1567,12 +1580,14 @@ public:
         n.param<double>("Reset/max_seed_jump_m", seed_bounds_.max_jump_m, 0.0);
         n.param<double>("Reset/max_seed_speed_mps", seed_bounds_.max_speed_mps, 0.0);
         n.param<double>("Reset/max_trusted_age_sec", seed_bounds_.max_trusted_age_s, 30.0);
+        n.param<double>("Reset/seed_retry_sec", seed_retry_sec_, 1.0);
         n.param<double>("Reset/escalate_after_sec",
                         reset_attempt_policy_.escalate_after_s, 5.0);
         n.param<double>("Reset/escalate_growth",
                         reset_attempt_policy_.escalate_growth, 2.0);
         n.param<double>("Reset/max_escalate_sec",
                         reset_attempt_policy_.max_escalate_s, 60.0);
+        n.param<bool>("Reset/keep_last_z", keep_last_z_, true);
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/point_notime", point_notime, 0);
         // 0 keeps every scan, which is what offline reprocessing wants.
@@ -1663,12 +1678,9 @@ public:
             else
                 ss = -1;
 
-            if (ss != 0)
-            {
-                printf("The pointcloud will be saved in this run.\n");
-                printf("So please clear or rename the existing folder.\n");
-                exit(0);
-            }
+            if (ss != 0) // was exit(0), which took the whole nodelet manager down
+                ROS_WARN("Save folder %s%s/ already exists or could not be created; "
+                         "files in it may be overwritten", savepath.c_str(), bagname.c_str());
         }
 
         sws.resize(thread_num);
@@ -2370,7 +2382,7 @@ public:
             wm->twist.twist.linear.z);
         Eigen::Vector3d v_wheel_in_base;
         if (wheel_odom_transform_required_ && wheel_odom_transform_ready_) {
-            v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+            v_wheel_in_base = wheelVelocityInBase(wheel_odom_rot_from_base_, v_wheel_in_wheel_frame);
         } else {
             v_wheel_in_base = v_wheel_in_wheel_frame;
         }
@@ -2457,7 +2469,7 @@ public:
             wm->twist.twist.linear.z);
         Eigen::Vector3d v_wheel_in_base = v_wheel_in_wheel_frame;
         if (wheel_odom_transform_required_ && wheel_odom_transform_ready_) {
-            v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+            v_wheel_in_base = wheelVelocityInBase(wheel_odom_rot_from_base_, v_wheel_in_wheel_frame);
         }
         const double v_wheel_y = v_wheel_in_base.y();
 
@@ -3016,13 +3028,18 @@ public:
             }
             else if (seeded == SeedOutcome::Accepted)
             {
+                // The 2D EKF's TF z is just the mount height; keep ours.
+                const bool keep_z = keep_last_z_ && have_last_good_z_;
+                if (keep_z)
+                    x_curr.p.z() = last_good_z_;
                 initialized_from_tf = true;
                 g_has_anchor = true;
                 g_pose_source = PoseSource::External;
                 markPoseDiscontinuity();
                 ROS_INFO_STREAM("Reset to TF " << odom_link << " -> " << base_link
-                                               << " using x/y/z/yaw: p=["
-                                               << x_curr.p.transpose() << "]");
+                                               << " using x/y/yaw, z from "
+                                               << (keep_z ? "last estimate" : "TF")
+                                               << ": p=[" << x_curr.p.transpose() << "]");
             }
             else
             {
@@ -3076,7 +3093,7 @@ public:
                 Eigen::Vector3d v_wheel_in_base = v_wheel_in_wheel_frame;
                 if (wheel_odom_transform_required_ && wheel_odom_transform_ready_)
                 {
-                    v_wheel_in_base = wheel_odom_rot_from_base_ * v_wheel_in_wheel_frame;
+                    v_wheel_in_base = wheelVelocityInBase(wheel_odom_rot_from_base_, v_wheel_in_wheel_frame);
                 }
                 x_curr.v = x_curr.R * v_wheel_in_base;
                 ROS_INFO("Reset seeded v=[%.3f %.3f %.3f] from wheel odom",
@@ -3389,7 +3406,7 @@ public:
                         ResultOutput::instance().pub_localtraj(dummy, 0.0, x_curr, sessionNames.size() - 1, pcl_path);
                     }
                 }
-                sleep(0.01);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // sleep(unsigned) truncated to 0
                 continue;
             }
             if (loop_detect == 1)
@@ -3399,7 +3416,7 @@ public:
                 jour = 0;
             }
 
-            n.param<bool>("finish", is_finish, false);
+            n.getParamCached("finish", is_finish); // uncached param() was an XML-RPC call per loop
             if (is_finish)
             {
                 break;
@@ -3433,7 +3450,7 @@ public:
                     malloc_trim(0);
                 }
 
-                sleep(0.001);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1)); // sleep(unsigned) truncated to 0
                 continue;
             }
 
@@ -3464,6 +3481,30 @@ public:
 
             updateLevelWindow(imus);
             updateGravityDatum();
+
+            // Nothing else retries a withheld seed, so the pose stayed unpublished
+            // until an unrelated reset. Probe it (non-blocking, no side effects);
+            // once it would be taken, re-seed through the normal reset path, whose
+            // own seed attempt decides whether the pose is anchored.
+            if (use_odom_init_tf && seed_withheld_ && !g_has_anchor && !motion_init_flag)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last_seed_retry_).count() >= seed_retry_sec_)
+                {
+                    last_seed_retry_ = now;
+                    Eigen::Vector3d seed_p;
+                    double seed_yaw = 0.0;
+                    if (lookupExternalOdomPositionAndYaw(seed_p, seed_yaw, 0.0) &&
+                        checkSeed(seed_p, seed_yaw, seed_bounds_, trusted_pose_,
+                                  ros::Time::now().toSec()).status == SeedStatus::Accepted)
+                    {
+                        forceReset("External seed accepted on retry; re-seeding", imus,
+                                   last_pos, jour, motion_init_flag, false);
+                        degrade_cnt = 0;
+                        continue;
+                    }
+                }
+            }
 
             static int first_flag = 1;
             if (first_flag)
@@ -3598,11 +3639,16 @@ public:
                 }
 
                 const uint8_t active_state_pre = std::min<uint8_t>(static_cast<uint8_t>(active_degrade_state_pre), static_cast<uint8_t>(DegradeState::High));
-                const int down_size_div = static_cast<int>(active_state_pre);
-                const double effective_down_size = base_down_size_ / static_cast<double>(down_size_div);
-                const double err_scale = std::sqrt(static_cast<double>(active_state_pre));
-                const double effective_dept_err = base_dept_err_; // * err_scale;
-                const double effective_beam_err = base_beam_err_; // * err_scale;
+                // Degrade state no longer scales the downsample resolution. Making
+                // the cloud finer in low-observability zones
+                // exploded the point count -> recut/BA/map cost blew the frame
+                // budget and the fine, non-planar points never restored
+                // observability, so the state latched at High. Downsample always
+                // at the configured base size; the IMU trust below still stiffens
+                // with degradation, which is the useful part of the response.
+                const double effective_down_size = base_down_size_;
+                const double effective_dept_err = base_dept_err_;
+                const double effective_beam_err = base_beam_err_;
                 imu_coef = base_imu_coef_ * static_cast<double>(active_state_pre);
 
                 {
@@ -3625,6 +3671,12 @@ public:
 
                 // Run state estimation
                 estimation_success = GPROF_CALL("lio", lio_state_estimation(pptr));
+                // Unanchored z is in no frame; keep_last_z must not carry it into a seed.
+                if (estimation_success && g_has_anchor)
+                {
+                    have_last_good_z_ = true;
+                    last_good_z_ = x_curr.p.z();
+                }
 
                 // Motion Stability Check (Phase 1 Degeneration Improvement)
                 // Compute rotation magnitude from last frame to detect rapid rotations
@@ -4078,7 +4130,7 @@ public:
 
             if (buf_lba2loop.empty() || loop_detect == 1)
             {
-                sleep(0.01);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // sleep(unsigned) truncated to 0
                 continue;
             }
             ScanPose* bl_head = nullptr;
@@ -4466,7 +4518,7 @@ public:
         {
             GPROF_SCOPE("gba_wait");
             while (gba_flag)
-                ;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // was a busy spin
         }
 
         for (PGO_Edge& edge : gba_edges1.edges)
@@ -4724,7 +4776,7 @@ public:
         {
             if (multimap_keyframes.empty())
             {
-                sleep(0.1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // sleep(unsigned) truncated to 0
                 continue;
             }
 
@@ -4744,7 +4796,7 @@ public:
             {
                 if (smp_flag == 0)
                 {
-                    sleep(0.1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // sleep(unsigned) truncated to 0
                     continue;
                 }
             }
@@ -4756,7 +4808,7 @@ public:
                 buf_base++;
                 if (localID.size() < wdsize)
                 {
-                    sleep(0.1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // sleep(unsigned) truncated to 0
                     continue;
                 }
             }

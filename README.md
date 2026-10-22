@@ -9,7 +9,7 @@
 - Disableable tf pub
 - Ability to start and recover from current odom
 - Added alternate odom source input as a sanity check reset (avoid runaways in corridors)
-- Merged [LTU-RAI's mods](https://github.com/LTU-RAI/Voxel-SLAM).
+- Merged [LTU-RAI's mods](https://github.com/LTU-RAI/voxel_slam).
 - Per-section timing through the shared `grover_profiling` harness (`GPROF_*`),
   with an opt-in periodic report (see below).
 

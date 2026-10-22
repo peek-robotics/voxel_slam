@@ -194,3 +194,18 @@ TEST(BodyVelocityUpdate, RejectsNonPositiveInnovationVariance)
   EXPECT_FALSE(u.applied);
   EXPECT_TRUE(u.dx.isZero());
 }
+
+// Wheel frame yawed +90 deg from base_link, so wheel x is base y. tf's
+// lookupTransform(wheel, base) rotation is then Rz(-90).
+TEST(WheelVelocityInBase, InvertsTheTfLookupRotation)
+{
+  const Eigen::Matrix3d rot_wheel_from_base = rpy(0.0, 0.0, -M_PI / 2);
+  const Eigen::Vector3d v_base =
+      wheelVelocityInBase(rot_wheel_from_base, Eigen::Vector3d(1.0, 0.0, 0.0));
+  EXPECT_NEAR(v_base.x(), 0.0, 1e-12);
+  EXPECT_NEAR(v_base.y(), 1.0, 1e-12);
+  // Round trip with the watchdog's direction (body velocity into the wheel frame).
+  const Eigen::Vector3d v_body(0.7, -0.2, 0.1);
+  const Eigen::Matrix3d R = rpy(0.1, -0.05, 2.3);
+  EXPECT_TRUE(wheelVelocityInBase(R, R * v_body).isApprox(v_body, 1e-12));
+}

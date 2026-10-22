@@ -100,8 +100,8 @@ target_link_libraries(${PROJECT_NAME}_nodelet ${PROJECT_NAME})
 add_dependencies(${PROJECT_NAME}_nodelet ${PROJECT_NAME} ${PROJECT_NAME}_generate_messages_cpp)
 
 if(CATKIN_ENABLE_TESTING)
-  # src/ before the global include path: include/ holds a stale duplicate of
-  # several headers.
+  # The headers under test (velocity_update.hpp, reset_attempt_policy.hpp, ...)
+  # live in src/, so put src/ on each test's include path.
   catkin_add_gtest(test_velocity_update test/test_velocity_update.cpp)
   target_include_directories(test_velocity_update BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
